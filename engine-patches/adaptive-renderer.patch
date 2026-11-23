@@ -18,7 +18,7 @@ index 11a5f77..0e44ddb 100644
      if (am == AM_ABSX || am == AM_ABSY) {
          for (int i = 0; i < cfg->ram_read_hook_count; i++)
 diff --git a/runner/include/config.h b/runner/include/config.h
-index 2a28f50..3c1743a 100644
+index 2a28f50..435d700 100644
 --- a/runner/include/config.h
 +++ b/runner/include/config.h
 @@ -24,7 +24,7 @@ typedef struct {
@@ -30,22 +30,25 @@ index 2a28f50..3c1743a 100644
      int player_src[2];    /* default { 2 gamepad (+ keyboard fallback), 2 gamepad } */
      int deadzone[2];      /* 0..100 percent; default { 30, 30 } */
  
-@@ -43,6 +43,9 @@ typedef struct {
+@@ -43,6 +43,12 @@ typedef struct {
       * + folder picker write these. NESRECOMP_HDPACK env overrides both. */
      int  hdpack_enabled;   /* 0 off, 1 on; default 1 (master switch) */
      char hdpack_dir[512];  /* pack folder; "" = default <exe>/hdpack */
 +    int outfit[2]; /* host-only shirt swatch, zero is Original */
++    int eyes[2], pants[2];
++    int hair_style[2]; /* host hairstyle, zero is Original */
 +    int hair[2]; /* independent host hair swatches */
 +    char widescreen_mode[16]; /* per-game aspect preset, empty = game default */
++    int oni_mode;
  } NesConfig;
  
  extern NesConfig g_nes_config;
-@@ -67,3 +70,7 @@ void config_load(const char *path);
+@@ -67,3 +73,7 @@ void config_load(const char *path);
  
  /* Write g_nes_config to config.ini at `path`. */
  void config_save(const char *path);
 +
-+typedef enum { DISPLAY_WIDESCREEN_MODE, DISPLAY_CRT, DISPLAY_FLICKER, DISPLAY_PIXEL_ASPECT, DISPLAY_ALEX_SHIRT, DISPLAY_RYAN_SHIRT, DISPLAY_ALEX_HAIR, DISPLAY_RYAN_HAIR } DisplaySetting;
++typedef enum { DISPLAY_WIDESCREEN_MODE, DISPLAY_CRT, DISPLAY_FLICKER, DISPLAY_PIXEL_ASPECT, DISPLAY_ALEX_SHIRT, DISPLAY_RYAN_SHIRT, DISPLAY_ALEX_HAIR, DISPLAY_RYAN_HAIR, DISPLAY_ALEX_STYLE, DISPLAY_RYAN_STYLE, DISPLAY_ALEX_EYES, DISPLAY_RYAN_EYES, DISPLAY_ALEX_PANTS, DISPLAY_RYAN_PANTS, DISPLAY_ONI_MODE } DisplaySetting;
 +/* Persist only the preference the player explicitly edited. */
 +void config_save_display_setting(DisplaySetting setting);
 diff --git a/runner/include/controller.h b/runner/include/controller.h
@@ -305,14 +308,14 @@ index f30d181..d1b52de 100644
      ${NESRECOMP_RUNNER_ROOT}/src/recomp_stack.c
      ${NESRECOMP_RUNNER_ROOT}/src/ppu_renderer.c
 diff --git a/runner/src/config.c b/runner/src/config.c
-index 0900816..a7b25c4 100644
+index 0900816..dfb677f 100644
 --- a/runner/src/config.c
 +++ b/runner/src/config.c
 @@ -66,6 +66,7 @@ NesConfig g_nes_config = {
      /*skip_launcher*/ 0,
      /*netplay*/ "Player", "ws://netplay.technicallycomputers.ca:8765",
      /*hdpack_enabled*/ 1, /*hdpack_dir*/ "",  /* on by default; loads <exe>/hdpack if present */
-+    {0, 0}, {0, 0}, "",
++    {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, "", 0,
  };
  
  void config_set_defaults(NesConfig *c) {
@@ -321,7 +324,7 @@ index 0900816..a7b25c4 100644
          0,
          "Player", "ws://netplay.technicallycomputers.ca:8765",
 -        1, "",
-+        1, "", {0, 0}, {0, 0}, "",
++        1, "", {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, "", 0,
      };
      if (c) *c = d;
  }
@@ -336,7 +339,7 @@ index 0900816..a7b25c4 100644
      FILE *f = fopen(path, "r");
      if (!f) return;
      char line[256];
-@@ -116,43 +117,44 @@ void config_load(const char *path) {
+@@ -116,43 +117,51 @@ void config_load(const char *path) {
          char *key = trim(s);
          char *valstr = trim(eq + 1);
          int   val = atoi(valstr);
@@ -355,6 +358,13 @@ index 0900816..a7b25c4 100644
 +        else if (!strcmp(key, "LinearFilter"))  c->linear_filter = val ? 1 : 0;
 +        else if (!strcmp(key, "Renderer"))      c->renderer      = clampi(val, 0, 1);
 +        else if (!strcmp(key, "Widescreen"))    c->widescreen    = val ? 1 : 0;
++        else if (!strcmp(key, "AlexEyes")) c->eyes[0] = val;
++        else if (!strcmp(key, "RyanEyes")) c->eyes[1] = val;
++        else if (!strcmp(key, "AlexPants")) c->pants[0] = val;
++        else if (!strcmp(key, "RyanPants")) c->pants[1] = val;
++        else if (!strcmp(key, "OniMode")) c->oni_mode = val != 0;
++        else if (!strcmp(key, "AlexHairStyle")) c->hair_style[0] = val;
++        else if (!strcmp(key, "RyanHairStyle")) c->hair_style[1] = val;
 +        else if (!strcmp(key, "AlexHair")) c->hair[0] = val;
 +        else if (!strcmp(key, "RyanHair")) c->hair[1] = val;
 +        else if (!strcmp(key, "AlexShirt")) c->outfit[0] = val;
@@ -406,7 +416,7 @@ index 0900816..a7b25c4 100644
      fprintf(f, "# NESRecomp settings — edited by the launcher's Settings view.\n");
      fprintf(f, "[Display]\n");
      fprintf(f, "WindowScale = %d\n",   c->window_scale);
-@@ -161,11 +163,14 @@ void config_save(const char *path) {
+@@ -161,11 +170,18 @@ void config_save(const char *path) {
      fprintf(f, "LinearFilter = %d\n",  c->linear_filter);
      fprintf(f, "Renderer = %d\n",      c->renderer);
      fprintf(f, "Widescreen = %d\n",    c->widescreen);
@@ -417,11 +427,15 @@ index 0900816..a7b25c4 100644
      fprintf(f, "HdPackEnabled = %d\n", c->hdpack_enabled);
      fprintf(f, "HdPackDir = %s\n",     c->hdpack_dir);
 +    fprintf(f, "[Characters]\nAlexShirt = %d\nRyanShirt = %d\n", c->outfit[0], c->outfit[1]);
++    fprintf(f, "OniMode = %d\n", c->oni_mode);
++    fprintf(f, "AlexEyes = %d\nRyanEyes = %d\n", c->eyes[0], c->eyes[1]);
++    fprintf(f, "AlexPants = %d\nRyanPants = %d\n", c->pants[0], c->pants[1]);
++    fprintf(f, "AlexHairStyle = %d\nRyanHairStyle = %d\n", c->hair_style[0], c->hair_style[1]);
 +    fprintf(f, "AlexHair = %d\nRyanHair = %d\n", c->hair[0], c->hair[1]);
      fprintf(f, "[Audio]\n");
      fprintf(f, "Volume = %d\n",        c->volume);
      fprintf(f, "[Input]\n");
-@@ -179,3 +184,25 @@ void config_save(const char *path) {
+@@ -179,3 +195,32 @@ void config_save(const char *path) {
      fprintf(f, "NetplayLobbyUrl = %s\n", c->netplay_lobby_url);
      fclose(f);
  }
@@ -437,6 +451,13 @@ index 0900816..a7b25c4 100644
 +    case DISPLAY_WIDESCREEN_MODE:
 +        memcpy(saved.widescreen_mode, g_nes_config.widescreen_mode, sizeof(saved.widescreen_mode));
 +        break;
++    case DISPLAY_ONI_MODE: saved.oni_mode = g_nes_config.oni_mode; break;
++    case DISPLAY_ALEX_EYES: saved.eyes[0] = g_nes_config.eyes[0]; break;
++    case DISPLAY_RYAN_EYES: saved.eyes[1] = g_nes_config.eyes[1]; break;
++    case DISPLAY_ALEX_PANTS: saved.pants[0] = g_nes_config.pants[0]; break;
++    case DISPLAY_RYAN_PANTS: saved.pants[1] = g_nes_config.pants[1]; break;
++    case DISPLAY_ALEX_STYLE: saved.hair_style[0] = g_nes_config.hair_style[0]; break;
++    case DISPLAY_RYAN_STYLE: saved.hair_style[1] = g_nes_config.hair_style[1]; break;
 +    case DISPLAY_ALEX_HAIR: saved.hair[0] = g_nes_config.hair[0]; break;
 +    case DISPLAY_RYAN_HAIR: saved.hair[1] = g_nes_config.hair[1]; break;
 +    case DISPLAY_ALEX_SHIRT: saved.outfit[0] = g_nes_config.outfit[0]; break;
@@ -928,7 +949,7 @@ index 65c7101..05ced53 100644
 +    return persist_bindings(before);
 +}
 diff --git a/runner/src/main_runner.c b/runner/src/main_runner.c
-index d6c9e03..8feacb0 100644
+index d6c9e03..a093d6f 100644
 --- a/runner/src/main_runner.c
 +++ b/runner/src/main_runner.c
 @@ -1,3 +1,6 @@
@@ -946,7 +967,15 @@ index d6c9e03..8feacb0 100644
  #include "ppu_dot.h"
  #include "interp.h"
  #ifdef NESRECOMP_NET
-@@ -197,7 +201,8 @@ int g_widescreen_right = 0;
+@@ -187,6 +191,7 @@ static int                s_hd_scale   = 1;
+ static SDL_Texture       *s_crt_texture = NULL;
+ static uint32_t          *s_crt_buf     = NULL;
+ static uint32_t          *s_crt_scratch = NULL;
++static CrtFilterCache    *s_crt_cache = NULL;
+ static int                s_window_focused = 1;
+ /* Widescreen globals — default to standard 4:3 NES output.
+  * Games override these in game_on_init() before the first frame. */
+@@ -197,7 +202,8 @@ int g_widescreen_right = 0;
  /* The framebuffer stays at its native width. Aspect correction is a pure
   * presentation choice so screenshots, PPU output, and determinism are unchanged. */
  static int presentation_width(void) {
@@ -956,7 +985,7 @@ index d6c9e03..8feacb0 100644
                                                                 : g_render_width;
  }
  
-@@ -207,7 +212,8 @@ static void apply_presentation_geometry(void) {
+@@ -207,7 +213,8 @@ static void apply_presentation_geometry(void) {
      int scale = s_hd_texture ? s_hd_scale : crt_active ? CRT_SCALE : 1;
      SDL_RenderSetLogicalSize(s_renderer, presentation_width() * scale, 240 * scale);
      SDL_RenderSetIntegerScale(s_renderer,
@@ -966,7 +995,7 @@ index d6c9e03..8feacb0 100644
              ? SDL_TRUE : SDL_FALSE);
  }
  
-@@ -224,10 +230,15 @@ int16_t g_ws_obj_true_rel  = 0;
+@@ -224,10 +231,15 @@ int16_t g_ws_obj_true_rel  = 0;
  uint8_t g_ws_obj_rel8      = 0;
  uint8_t g_ws_obj_ctx_valid = 0;
  
@@ -984,7 +1013,7 @@ index d6c9e03..8feacb0 100644
  
  /* On-demand render for Zapper light detection.  The game reads the light sensor
   * mid-frame (during func_NMI / the main loop), so we render the CURRENT PPU state
-@@ -241,7 +252,73 @@ static uint32_t           s_present_buf[512 * 240];
+@@ -241,7 +253,73 @@ static uint32_t           s_present_buf[512 * 240];
   * main loop ~813 re-rendered s_framebuf, so live display was usually spared).
   * Rendering into s_zapper_snapbuf keeps the two paths symmetric and leaves the
   * display buffer untouched. */
@@ -1059,7 +1088,7 @@ index d6c9e03..8feacb0 100644
  static void zapper_on_demand_render(void) {
      if (g_dot_ppu_on)
          ppu_dot_render_snapshot(s_zapper_snapbuf);
-@@ -261,8 +338,9 @@ static int turbo_active(void) {
+@@ -261,8 +339,9 @@ static int turbo_active(void) {
      return g_turbo || s_turbo_hotkey_held;
  }
  
@@ -1070,7 +1099,7 @@ index d6c9e03..8feacb0 100644
      const double ntsc_hz = 60.0988;
  
      if (turbo_active()) {
-@@ -587,7 +665,7 @@ void save_png(const char *path, int w, int h, const void *rgb, int stride) {
+@@ -587,7 +666,7 @@ void save_png(const char *path, int w, int h, const void *rgb, int stride) {
  
  /* Save an ARGB8888 buffer as PNG. Callable from game code (emulated mode screenshots). */
  void runner_save_argb_png(const char *path, const uint32_t *argb, int w, int h) {
@@ -1079,7 +1108,7 @@ index d6c9e03..8feacb0 100644
      int pixels = w * h;
      for (int i = 0; i < pixels; i++) {
          uint32_t px = argb[i];
-@@ -802,6 +880,67 @@ static void benchmark_write_results(Uint64 end_counter) {
+@@ -802,6 +881,67 @@ static void benchmark_write_results(Uint64 end_counter) {
      if (s_benchmark_output && f != stdout) fclose(f);
  }
  
@@ -1102,7 +1131,7 @@ index d6c9e03..8feacb0 100644
 +    } else if (g_nes_config.crt_filter && s_crt_texture && s_crt_buf) {
 +        int crt_width = presentation_width();
 +        SDL_Rect crt_source = { 0, 0, crt_width * CRT_SCALE, 240 * CRT_SCALE };
-+        crt_filter_apply_3x(present, g_render_width, 240, crt_width,
++        crt_filter_apply_cached(s_crt_cache, present, g_render_width, 240, crt_width,
 +                            s_crt_buf, s_crt_scratch);
 +        SDL_UpdateTexture(s_crt_texture, &crt_source, s_crt_buf,
 +                          crt_source.w * 4);
@@ -1147,7 +1176,7 @@ index d6c9e03..8feacb0 100644
  /* ---- VBlank callback (called from ppu_read_reg when $2002 bit7 fires) ---- */
  void nes_vblank_callback(void) {
      static uint64_t s_cb_count = 0;
-@@ -875,14 +1014,41 @@ void nes_vblank_callback(void) {
+@@ -875,14 +1015,41 @@ void nes_vblank_callback(void) {
          if (ev.type == SDL_WINDOWEVENT &&
              ev.window.event == SDL_WINDOWEVENT_FOCUS_GAINED)
              s_window_focused = 1;
@@ -1189,7 +1218,7 @@ index d6c9e03..8feacb0 100644
          }
          if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_TAB)
              s_turbo_hotkey_held = 1;
-@@ -893,7 +1059,7 @@ void nes_vblank_callback(void) {
+@@ -893,7 +1060,7 @@ void nes_vblank_callback(void) {
              (ev.key.keysym.mod & KMOD_CTRL)) {
              g_nes_config.aspect_4_3 = !g_nes_config.aspect_4_3;
              apply_presentation_geometry();
@@ -1198,7 +1227,7 @@ index d6c9e03..8feacb0 100644
              if (s_window && !(SDL_GetWindowFlags(s_window) & SDL_WINDOW_FULLSCREEN)) {
                  int ww, wh;
                  SDL_GetWindowSize(s_window, &ww, &wh);
-@@ -910,7 +1076,7 @@ void nes_vblank_callback(void) {
+@@ -910,7 +1077,7 @@ void nes_vblank_callback(void) {
              (ev.key.keysym.mod & KMOD_CTRL)) {
              g_nes_config.reduce_sprite_flicker =
                  !g_nes_config.reduce_sprite_flicker;
@@ -1207,7 +1236,7 @@ index d6c9e03..8feacb0 100644
              printf("[Display] Reduce sprite flicker: %s\n",
                     g_nes_config.reduce_sprite_flicker ? "on" : "off");
          }
-@@ -920,7 +1086,7 @@ void nes_vblank_callback(void) {
+@@ -920,7 +1087,7 @@ void nes_vblank_callback(void) {
              (ev.key.keysym.mod & KMOD_CTRL)) {
              g_nes_config.crt_filter = !g_nes_config.crt_filter;
              apply_presentation_geometry();
@@ -1216,7 +1245,7 @@ index d6c9e03..8feacb0 100644
              printf("[Display] CRT/composite filter: %s\n",
                     g_nes_config.crt_filter ? "on" : "off");
          }
-@@ -972,7 +1138,7 @@ void nes_vblank_callback(void) {
+@@ -972,7 +1139,7 @@ void nes_vblank_callback(void) {
  #ifdef NESRECOMP_NET
      if (!nes_netplay_active())
  #endif
@@ -1225,7 +1254,7 @@ index d6c9e03..8feacb0 100644
          if (s_audio_dev) SDL_PauseAudioDevice(s_audio_dev, 1);
          if (!SDL_WaitEventTimeout(&ev, 100)) continue;
  
-@@ -995,6 +1161,13 @@ void nes_vblank_callback(void) {
+@@ -995,6 +1162,13 @@ void nes_vblank_callback(void) {
          }
      }
  
@@ -1239,7 +1268,7 @@ index d6c9e03..8feacb0 100644
      /* Zapper mouse input: poll absolute mouse position each frame. A script
       * TRIGGER takes precedence — the mouse must not clobber a scripted aim/
       * trigger (it would reset g_zapper_x/y/trigger every frame, defeating any
-@@ -1011,14 +1184,18 @@ void nes_vblank_callback(void) {
+@@ -1011,14 +1185,18 @@ void nes_vblank_callback(void) {
          const uint8_t *keys = SDL_GetKeyboardState(NULL);
          /* Assign connected pads densely to players configured for gamepad input.
           * Physical pad slot 1 must not disappear merely because P1 uses keyboard. */
@@ -1266,7 +1295,7 @@ index d6c9e03..8feacb0 100644
          /* Recording: capture combined input before script override */
          record_tick(g_frame_count, btn, turbo_active());
  
-@@ -1031,7 +1208,7 @@ void nes_vblank_callback(void) {
+@@ -1031,7 +1209,7 @@ void nes_vblank_callback(void) {
          if (tcp_btn >= 0) btn = (uint8_t)tcp_btn;
  
          g_controller1_buttons = btn;
@@ -1275,7 +1304,7 @@ index d6c9e03..8feacb0 100644
      }
  
  smoke_skip_input:
-@@ -1052,6 +1229,9 @@ smoke_skip_input:
+@@ -1052,6 +1230,9 @@ smoke_skip_input:
          uint8_t local = nes_netplay_input_player()
                        ? g_controller2_buttons : g_controller1_buttons;
          uint32_t tick = 0, a = 0, b = 0;
@@ -1285,7 +1314,7 @@ index d6c9e03..8feacb0 100644
          if (nes_netplay_needs_local_sample()) nes_netplay_stage_local(local);
          while (!nes_netplay_poll_admit()) {
              if (nes_netplay_state_desync(&tick, &a, &b)) {
-@@ -1072,6 +1252,8 @@ smoke_skip_input:
+@@ -1072,6 +1253,8 @@ smoke_skip_input:
          }
          if (nes_netplay_state_desync(&tick, &a, &b))
              netplay_return_to_lobby("deterministic state mismatch");
@@ -1294,7 +1323,7 @@ index d6c9e03..8feacb0 100644
          g_controller1_buttons = nes_netplay_published_buttons(0);
          g_controller2_buttons = nes_netplay_published_buttons(1);
      }
-@@ -1470,6 +1652,7 @@ smoke_skip_input:
+@@ -1470,6 +1653,7 @@ smoke_skip_input:
              exit(0);
          }
          finish_frame_callback();
@@ -1302,7 +1331,7 @@ index d6c9e03..8feacb0 100644
          return; /* skip all SDL rendering/pacing */
      }
  
-@@ -1537,7 +1720,7 @@ smoke_skip_input:
+@@ -1537,7 +1721,7 @@ smoke_skip_input:
      {
          char shot_path[256];
          if (script_wants_screenshot(shot_path, sizeof(shot_path))) {
@@ -1311,7 +1340,7 @@ index d6c9e03..8feacb0 100644
                  /* Capture the HD output so screenshots match what is displayed. */
                  int hw = g_render_width * s_hd_scale, hh = 240 * s_hd_scale;
                  hdpack_upscale(s_framebuf, g_render_width, s_hd_buf);
-@@ -1554,7 +1737,7 @@ smoke_skip_input:
+@@ -1554,7 +1738,7 @@ smoke_skip_input:
                      printf("[Shot] %s (HD %dx%d)\n", shot_path, hw, hh);
                  }
              } else {
@@ -1320,7 +1349,7 @@ index d6c9e03..8feacb0 100644
                  int npx = g_render_width * 240;
                  for (int i = 0; i < npx; i++) {
                      uint32_t px = s_framebuf[i];
-@@ -1613,35 +1796,17 @@ smoke_skip_input:
+@@ -1613,35 +1797,17 @@ smoke_skip_input:
       * In turbo mode, only present every 16th frame to avoid vsync blocking
       * on every SDL_RenderPresent call (~6ms each on a 165Hz monitor). */
      if (!turbo_active() || (g_frame_count & 15) == 0) {
@@ -1364,7 +1393,16 @@ index d6c9e03..8feacb0 100644
      pace_ntsc_frame();
      finish_frame_callback();
  }
-@@ -1753,7 +1918,12 @@ uint8_t *runner_get_prg_bank_rw(int bank_num) {
+@@ -1657,7 +1823,7 @@ void runner_present_framebuf(const uint32_t *argb_buf) {
+     if (g_nes_config.crt_filter && s_crt_texture && s_crt_buf) {
+         int crt_width = presentation_width();
+         SDL_Rect crt_source = { 0, 0, crt_width * CRT_SCALE, 240 * CRT_SCALE };
+-        crt_filter_apply_3x(argb_buf, g_render_width, 240, crt_width,
++        crt_filter_apply_cached(s_crt_cache, argb_buf, g_render_width, 240, crt_width,
+                             s_crt_buf, s_crt_scratch);
+         SDL_UpdateTexture(s_crt_texture, &crt_source, s_crt_buf,
+                           crt_source.w * 4);
+@@ -1753,7 +1919,12 @@ uint8_t *runner_get_prg_bank_rw(int bank_num) {
   * ROM discovery and CRC verification. argv[1] is guaranteed to be the ROM path.
   */
  int nesrecomp_runner_run(int argc, char *argv[]) {
@@ -1377,7 +1415,7 @@ index d6c9e03..8feacb0 100644
      /* Parse optional flags */
      for (int i = 2; i < argc; i++) {
          if      (strcmp(argv[i], "--script")    == 0 && i+1 < argc) s_script_path    = argv[++i];
-@@ -1796,7 +1966,12 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
+@@ -1796,7 +1967,12 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
  
      runtime_session_reset();
      runtime_init();
@@ -1390,7 +1428,7 @@ index d6c9e03..8feacb0 100644
      savestate_slots_init();
      game_on_init();
  
-@@ -1847,7 +2022,7 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
+@@ -1847,7 +2023,7 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
              printf("[Smoke] Headless mode: running %d frames, hashing every %d\n",
                     s_smoke_frames, s_smoke_interval);
          }
@@ -1399,7 +1437,7 @@ index d6c9e03..8feacb0 100644
          run_guest_execution();
          fprintf(stderr, "[Headless] game_run_main returned unexpectedly at frame %llu\n",
                  (unsigned long long)g_frame_count);
-@@ -1915,6 +2090,9 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
+@@ -1915,6 +2091,9 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
          char window_title[64];
          snprintf(window_title, sizeof(window_title), "NESRecomp - %s", game_get_name());
          Uint32 win_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
@@ -1409,7 +1447,7 @@ index d6c9e03..8feacb0 100644
          /* Launcher tri-state: 1 = borderless (desktop resolution, letterboxed by
           * SDL_RenderSetLogicalSize), 2 = exclusive (real display mode change). */
          if (g_nes_config.fullscreen == 2)      win_flags |= SDL_WINDOW_FULLSCREEN;
-@@ -1960,7 +2138,7 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
+@@ -1960,7 +2139,7 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
      apply_presentation_geometry();
  
      {
@@ -1418,7 +1456,14 @@ index d6c9e03..8feacb0 100644
          int cw = max_crt_width * CRT_SCALE;
          int ch = 240 * CRT_SCALE;
          s_crt_buf = (uint32_t *)malloc((size_t)cw * ch * sizeof(uint32_t));
-@@ -1985,6 +2163,14 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
+@@ -1979,12 +2158,21 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
+             /* MiSTer's scaler uses filtered interpolation around its mask.
+              * Linear sampling prevents the 6x6 JVC slots from becoming hard
+              * rectangles when the window is resized by a fractional amount. */
++            s_crt_cache = crt_filter_cache_create();
+             SDL_SetTextureScaleMode(s_crt_texture, SDL_ScaleModeLinear);
+             printf("[Display] CRT/composite filter available (%s)\n",
+                    g_nes_config.crt_filter ? "enabled" : "disabled");
          }
          apply_presentation_geometry();
      }
@@ -1433,7 +1478,7 @@ index d6c9e03..8feacb0 100644
  
      /* HD texture pack (Mesen HD Pack): opt-in via the NESRECOMP_HDPACK env var
       * or config.ini [Display] HdPackEnabled/HdPackDir. When a pack loads, present
-@@ -2025,7 +2211,7 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
+@@ -2025,7 +2213,7 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
          }
      }
  
@@ -1442,7 +1487,7 @@ index d6c9e03..8feacb0 100644
  
      /* Present-time palette LUT: default Raw (passthrough, byte-identical);
       * opt in via NESRECOMP_PALETTE={raw,2c02,fbx}. */
-@@ -2097,6 +2283,9 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
+@@ -2097,6 +2285,9 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
      s_netplay_return_ready = 0;
  #endif
  
@@ -1452,6 +1497,14 @@ index d6c9e03..8feacb0 100644
      /* Unreachable for most games, but clean up anyway */
      if (s_audio_dev) { SDL_CloseAudioDevice(s_audio_dev); s_audio_dev = 0; }
      if (s_bridge_ready) { rab_free(&s_bridge); s_bridge_ready = 0; }
+@@ -2106,6 +2297,7 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
+     controller_shutdown();
+     if (s_hd_texture) { SDL_DestroyTexture(s_hd_texture); s_hd_texture = NULL; }
+     free(s_hd_buf); s_hd_buf = NULL; hdpack_unload();
++    crt_filter_cache_destroy(s_crt_cache); s_crt_cache = NULL;
+     if (s_crt_texture) { SDL_DestroyTexture(s_crt_texture); s_crt_texture = NULL; }
+     free(s_crt_buf); s_crt_buf = NULL;
+     free(s_crt_scratch); s_crt_scratch = NULL;
 diff --git a/runner/src/nes_video.c b/runner/src/nes_video.c
 new file mode 100644
 index 0000000..8738e9e
@@ -1643,7 +1696,7 @@ index 6813bb9..06f162f 100644
  static uint32_t *s_fb        = NULL;             /* presentation framebuffer */
  static uint32_t  s_back[DOT_MAXW * VISIBLE_LINES]; /* render target (double buffer) */
 diff --git a/runner/src/ppu_renderer.c b/runner/src/ppu_renderer.c
-index 3ce36ba..48ede58 100644
+index 3ce36ba..679e0f7 100644
 --- a/runner/src/ppu_renderer.c
 +++ b/runner/src/ppu_renderer.c
 @@ -5,6 +5,7 @@
@@ -1682,37 +1735,76 @@ index 3ce36ba..48ede58 100644
      memcpy(s_chr_pre_irq, g_chr_ram, sizeof(s_chr_pre_irq));
 +#ifdef NESRECOMP_DESKTOP_PAUSE
 +    extern void rcr_native_sprite_tags(uint8_t tags[64]);
-+    extern uint8_t rcr_shirt_color(int owner, uint8_t original);
-+    extern uint8_t rcr_sprite_color(uint8_t tag,uint8_t tile,int row,int bit,int pixel,uint8_t original);
++    extern void rcr_style_sprite_row(uint8_t tag,uint8_t tile,int row,uint8_t *lo,uint8_t *hi);
++    extern uint8_t rcr_sprite_color(uint8_t tag,uint8_t tile,int row,int bit,int pixel,const uint8_t palette[4]);
 +    uint8_t appearance_tags[64];
 +    rcr_native_sprite_tags(appearance_tags);
 +#endif
      uint8_t render_oam[0x100];
      uint16_t render_oam_x16[64];
      uint8_t render_start_mask = g_ppumask;
-@@ -1173,6 +1187,10 @@ render_sprites:
+@@ -1132,6 +1146,10 @@ render_sprites:
+                     ? g_chr_ram : s_chr_pre_irq;
+             uint8_t lo = chr_src[chr_off];
+             uint8_t hi = chr_src[chr_off + 8];
++#ifdef NESRECOMP_DESKTOP_PAUSE
++            uint8_t guest_opaque = lo | hi;
++            if (appearance_tags[s]) rcr_style_sprite_row(appearance_tags[s],tile_num,tile_row,&lo,&hi);
++#endif
+ 
+             for (int bit = 7; bit >= 0; bit--) {
+                 /* flip_h mirrors which CHR bit we read; screen position is always (7-bit) */
+@@ -1141,7 +1159,12 @@ render_sprites:
+                  * margins are 0). */
+                 if (px < -ws_eff_l || px >= 256 + ws_eff_r) continue;
+                 int color_idx = ((lo >> chr_bit) & 1) | (((hi >> chr_bit) & 1) << 1);
+-                if (color_idx == 0) continue; /* transparent */
++#ifdef NESRECOMP_DESKTOP_PAUSE
++                int hit_pixel = s == 0 && (guest_opaque & (1u << chr_bit));
++#else
++                int hit_pixel = s == 0 && color_idx;
++#endif
++                if (!color_idx && !hit_pixel) continue;
+                 /* PPUMASK bit 2: clip leftmost 8 sprite pixels */
+                 if (px < 8 && !(row_mask & 0x04)) continue;
+                 /* Offset sprite X into widescreen framebuffer */
+@@ -1156,11 +1179,12 @@ render_sprites:
+                     s_bg_opaque_width == g_render_width &&
+                     fb_x >= 0 && fb_x < g_render_width &&
+                     s_bg_opaque_snapshot[(size_t)py * g_render_width + fb_x];
+-                if (s == 0 && px >= 0 && px < 255 && (row_mask & 0x18) == 0x18) {
++                if (hit_pixel && px >= 0 && px < 255 && (row_mask & 0x18) == 0x18) {
+                     int bg_clipped = (px < 8 && !(row_mask & 0x02));
+                     if (!bg_clipped && bg_opaque)
+                         g_ppustatus |= 0x40;
+                 }
++                if (!color_idx) continue;
+                 /* Priority=1: sprite behind BG — only draw where BG is transparent */
+                 if (priority && bg_opaque) {
+                     size_t off = (size_t)py * g_render_width + fb_x;
+@@ -1173,6 +1197,10 @@ render_sprites:
                      continue;
                  }
                  uint8_t nes_color = g_ppu_pal[(spr_pal * 4 + color_idx) & 0x1F] & 0x3F;
 +#ifdef NESRECOMP_DESKTOP_PAUSE
 +                if (appearance_tags[s])
-+                    nes_color = rcr_sprite_color(appearance_tags[s], tile_num, tile_row, chr_bit, color_idx, nes_color);
++                    nes_color = rcr_sprite_color(appearance_tags[s], tile_num, tile_row, chr_bit, color_idx, &g_ppu_pal[spr_pal * 4]);
 +#endif
                  uint32_t spc = g_nes_palette[nes_color];
                  framebuf[py * g_render_width + fb_x] = spc;
                  if (g_hp && fb_x >= 0 && fb_x < g_render_width) {
-@@ -1182,6 +1200,10 @@ render_sprites:
+@@ -1182,6 +1210,10 @@ render_sprites:
                      hp->sp_t16   = &chr_src[tile_chr_base + tile_num * 16];
                      hp->sp_p1 = g_ppu_pal[(spr_pal * 4 + 1) & 0x1F] & 0x3F;
                      hp->sp_p2 = g_ppu_pal[(spr_pal * 4 + 2) & 0x1F] & 0x3F;
 +#ifdef NESRECOMP_DESKTOP_PAUSE
 +                    if (color_idx==1) hp->sp_p1=nes_color;
-+                    hp->sp_p2 = rcr_shirt_color(appearance_tags[s] & 3, hp->sp_p2);
++                    hp->sp_p2 = rcr_sprite_color(appearance_tags[s], tile_num, tile_row, chr_bit, 2, &g_ppu_pal[spr_pal * 4]);
 +#endif
                      hp->sp_p3 = g_ppu_pal[(spr_pal * 4 + 3) & 0x1F] & 0x3F;
                      hp->sp_ox = (uint8_t)(7 - bit);   /* screen column within tile */
                      hp->sp_oy = (uint8_t)(row & 7);   /* screen row within displayed cell */
-@@ -1209,3 +1231,113 @@ render_sprites:
+@@ -1209,3 +1241,113 @@ render_sprites:
      }
  #endif
  }
@@ -2029,3 +2121,253 @@ index 4107e27..1e21829 100644
      printf("\n==== interp self-test: %d checks, %d failures ====\n", g_checks, g_fails);
      return g_fails;
  }
+diff --git a/runner/include/crt_filter.h b/runner/include/crt_filter.h
+index 23f13d6..f228632 100644
+--- a/runner/include/crt_filter.h
++++ b/runner/include/crt_filter.h
+@@ -10,3 +10,12 @@
+ void crt_filter_apply_3x(const uint32_t *src, int source_width, int height,
+                          int presentation_width, uint32_t *dst,
+                          uint32_t *scratch);
++
++/* Optional per-presenter history. Supply the same non-null dst and scratch
++ * buffer sizes as above. A NULL cache falls back to a full render. */
++typedef struct CrtFilterCache CrtFilterCache;
++CrtFilterCache *crt_filter_cache_create(void);
++void crt_filter_cache_destroy(CrtFilterCache *cache);
++void crt_filter_apply_cached(CrtFilterCache *cache, const uint32_t *src,
++                             int source_width, int height, int presentation_width,
++                             uint32_t *dst, uint32_t *scratch);
+diff --git a/runner/src/crt_filter.c b/runner/src/crt_filter.c
+index 8be24cc..a1429fd 100644
+--- a/runner/src/crt_filter.c
++++ b/runner/src/crt_filter.c
+@@ -1,5 +1,6 @@
+ #include "crt_filter.h"
+ #include <string.h>
++#include <stdlib.h>
+ 
+ static int clamp8(int v) {
+     return v < 0 ? 0 : v > 255 ? 255 : v;
+@@ -47,6 +48,40 @@ static uint32_t sample_scaled(const uint32_t *src, int source_width,
+            ((uint32_t)g << 8) | (uint32_t)bl;
+ }
+ 
++static inline uint32_t glass_pixel(const uint32_t *upper, const uint32_t *center,
++                                   const uint32_t *lower, int xl, int x, int xr) {
++    uint32_t c = center[x];
++    uint32_t l = center[xl];
++    uint32_t r = center[xr];
++    uint32_t u = upper[x];
++    uint32_t d = lower[x];
++    uint32_t ul = upper[xl];
++    uint32_t ur = upper[xr];
++    uint32_t dl = lower[xl];
++    uint32_t dr = lower[xr];
++    int br = (channel(l, 16) + channel(r, 16) +
++              channel(u, 16) + channel(d, 16)) >> 2;
++    int bg = (channel(l, 8) + channel(r, 8) +
++              channel(u, 8) + channel(d, 8)) >> 2;
++    int bb = (channel(l, 0) + channel(r, 0) +
++              channel(u, 0) + channel(d, 0)) >> 2;
++    int dr8 = (channel(ul, 16) + channel(ur, 16) +
++               channel(dl, 16) + channel(dr, 16)) >> 2;
++    int dg8 = (channel(ul, 8) + channel(ur, 8) +
++               channel(dl, 8) + channel(dr, 8)) >> 2;
++    int db8 = (channel(ul, 0) + channel(ur, 0) +
++               channel(dl, 0) + channel(dr, 0)) >> 2;
++    int bloom_luma = (br * 54 + bg * 183 + bb * 19) >> 8;
++    int rr = clamp8((channel(c, 16) * 218 + br * 28 + dr8 * 10 +
++                     bloom_luma * 4) >> 8);
++    int gg = clamp8((channel(c, 8) * 218 + bg * 28 + dg8 * 10 +
++                     bloom_luma * 4) >> 8);
++    int bl = clamp8((channel(c, 0) * 218 + bb * 28 + db8 * 10 +
++                     bloom_luma * 4) >> 8);
++    return 0xFF000000u |
++        ((uint32_t)rr << 16) | ((uint32_t)gg << 8) | (uint32_t)bl;
++}
++
+ void crt_filter_apply_3x(const uint32_t *src, int source_width, int height,
+                          int presentation_width, uint32_t *dst,
+                          uint32_t *scratch) {
+@@ -171,40 +206,146 @@ void crt_filter_apply_3x(const uint32_t *src, int source_width, int height,
+     for (int y = 0; y < out_height; y++) {
+         int yu = y > 0 ? y - 1 : y;
+         int yd = y + 1 < out_height ? y + 1 : y;
+-        for (int x = 0; x < out_width; x++) {
+-            int xl = x > 0 ? x - 1 : x;
+-            int xr = x + 1 < out_width ? x + 1 : x;
+-            uint32_t c = dst[y * out_width + x];
+-            uint32_t l = dst[y * out_width + xl];
+-            uint32_t r = dst[y * out_width + xr];
+-            uint32_t u = dst[yu * out_width + x];
+-            uint32_t d = dst[yd * out_width + x];
+-            uint32_t ul = dst[yu * out_width + xl];
+-            uint32_t ur = dst[yu * out_width + xr];
+-            uint32_t dl = dst[yd * out_width + xl];
+-            uint32_t dr = dst[yd * out_width + xr];
+-            int br = (channel(l, 16) + channel(r, 16) +
+-                      channel(u, 16) + channel(d, 16)) >> 2;
+-            int bg = (channel(l, 8) + channel(r, 8) +
+-                      channel(u, 8) + channel(d, 8)) >> 2;
+-            int bb = (channel(l, 0) + channel(r, 0) +
+-                      channel(u, 0) + channel(d, 0)) >> 2;
+-            int dr8 = (channel(ul, 16) + channel(ur, 16) +
+-                       channel(dl, 16) + channel(dr, 16)) >> 2;
+-            int dg8 = (channel(ul, 8) + channel(ur, 8) +
+-                       channel(dl, 8) + channel(dr, 8)) >> 2;
+-            int db8 = (channel(ul, 0) + channel(ur, 0) +
+-                       channel(dl, 0) + channel(dr, 0)) >> 2;
+-            int bloom_luma = (br * 54 + bg * 183 + bb * 19) >> 8;
+-            int rr = clamp8((channel(c, 16) * 218 + br * 28 + dr8 * 10 +
+-                             bloom_luma * 4) >> 8);
+-            int gg = clamp8((channel(c, 8) * 218 + bg * 28 + dg8 * 10 +
+-                             bloom_luma * 4) >> 8);
+-            int bl = clamp8((channel(c, 0) * 218 + bb * 28 + db8 * 10 +
+-                             bloom_luma * 4) >> 8);
+-            scratch[y * out_width + x] = 0xFF000000u |
+-                ((uint32_t)rr << 16) | ((uint32_t)gg << 8) | (uint32_t)bl;
+-        }
++        const uint32_t *upper = dst + yu * out_width;
++        const uint32_t *center = dst + y * out_width;
++        const uint32_t *lower = dst + yd * out_width;
++        uint32_t *out = scratch + y * out_width;
++        /* Keep edge clamps out of the contiguous, vectorizable inner loop. */
++        int last = out_width - 1;
++        out[0] = glass_pixel(upper, center, lower, 0, 0, 1);
++        for (int x = 1; x < last; x++)
++            out[x] = glass_pixel(upper, center, lower, x - 1, x, x + 1);
++        out[last] = glass_pixel(upper, center, lower, last - 1, last, last);
+     }
+     memcpy(dst, scratch, (size_t)out_width * out_height * sizeof(uint32_t));
+ }
++
++/* The beam and glass passes together read up to two source pixels beyond
++ * the block. Even block origins and displacements preserve the mask phase.
++ * Two frames of history let a one-pixel pan find its phase two frames back. */
++enum { TILE = 16, MARGIN = 2, PATCH = TILE + 2 * MARGIN };
++
++typedef struct {
++    uint32_t *picture, *glass;
++    int valid;
++} CrtFrame;
++
++struct CrtFilterCache {
++    CrtFrame history[2];
++    int width, height, next;
++};
++
++CrtFilterCache *crt_filter_cache_create(void) {
++    return calloc(1, sizeof(CrtFilterCache));
++}
++
++static void clear_history(CrtFilterCache *cache) {
++    for (int i = 0; i < 2; i++) {
++        free(cache->history[i].picture);
++        free(cache->history[i].glass);
++    }
++    memset(cache, 0, sizeof *cache);
++}
++
++void crt_filter_cache_destroy(CrtFilterCache *cache) {
++    if (cache) clear_history(cache);
++    free(cache);
++}
++
++static int prepare_history(CrtFilterCache *cache, int width, int height) {
++    if (cache->width == width && cache->height == height)
++        return cache->history[0].picture != NULL;
++
++    clear_history(cache);
++    size_t bytes = (size_t)width * height * sizeof(uint32_t);
++    for (int i = 0; i < 2; i++) {
++        cache->history[i].picture = malloc(bytes);
++        cache->history[i].glass = malloc(bytes * 9);
++        if (!cache->history[i].picture || !cache->history[i].glass) {
++            clear_history(cache);
++            break;
++        }
++    }
++    cache->width = width;
++    cache->height = height;
++    return cache->history[0].picture != NULL;
++}
++
++static int same_patch(const uint32_t *a, const uint32_t *b, int pitch, int w, int h) {
++    for (int row = 0; row < h; row++) {
++        if (memcmp(a + row * pitch, b + row * pitch, w * sizeof *a)) return 0;
++    }
++    return 1;
++}
++
++static const uint32_t *matching_block(const CrtFilterCache *cache, const uint32_t *src,
++                                      int x, int y, int x0, int y0, int w, int h) {
++    static const int shifts[] = {0, 2, -2, 4, -4, 6, -6, 8, -8};
++    int width = cache->width;
++    int pos = y0 * width + x0;
++    for (unsigned j = 0; j < sizeof shifts / sizeof shifts[0]; j++) {
++        int dx = shifts[j];
++        /* A block clipped at the real screen edge needs that same clamp. */
++        if (dx && (x0 == 0 || x0 + w == width || x0 + dx < 0 || x0 + w + dx > width))
++            continue;
++        for (int age = 0; age < 2; age++) {
++            int index = age == 0 ? 1 - cache->next : cache->next;
++            const CrtFrame *old = &cache->history[index];
++            if (old->valid && same_patch(src + pos, old->picture + (pos + dx), width, w, h))
++                return old->glass + (y * 3 * width + x + dx) * 3;
++        }
++    }
++    return NULL;
++}
++
++void crt_filter_apply_cached(CrtFilterCache *cache, const uint32_t *src,
++                             int source_width, int height, int width,
++                             uint32_t *dst, uint32_t *scratch) {
++    if (!src || !dst || !scratch || source_width <= 0 || width <= 0 || height <= 0) return;
++    if (!cache || !prepare_history(cache, width, height)) {
++        crt_filter_apply_3x(src, source_width, height, width, dst, scratch);
++        return;
++    }
++
++    CrtFrame *current = &cache->history[cache->next];
++    /* scratch holds the full filter output on the uncached path. Reuse its
++     * beginning for aspect correction while rendering individual patches. */
++    if (source_width != width) {
++        for (int y = 0; y < height; y++)
++            for (int x = 0; x < width; x++)
++                scratch[y * width + x] = sample_scaled(src, source_width, width, y, x);
++        src = scratch;
++    }
++
++    if (!cache->history[1 - cache->next].valid) {
++        crt_filter_apply_3x(src, width, height, width, dst, current->glass);
++    } else {
++        uint32_t input[PATCH * PATCH], beam[PATCH * PATCH * 9], blur[PATCH * PATCH * 9];
++        for (int y = 0; y < height; y += TILE) {
++            for (int x = 0; x < width; x += TILE) {
++                int tile_w = width - x < TILE ? width - x : TILE;
++                int tile_h = height - y < TILE ? height - y : TILE;
++                int x0 = x ? x - MARGIN : 0, y0 = y ? y - MARGIN : 0;
++                int x1 = width - x - tile_w < MARGIN ? width : x + tile_w + MARGIN;
++                int y1 = height - y - tile_h < MARGIN ? height : y + tile_h + MARGIN;
++                int w = x1 - x0, h = y1 - y0;
++                const uint32_t *result = matching_block(cache, src, x, y, x0, y0, w, h);
++                int pitch = width * 3;
++                if (!result) {
++                    for (int row = 0; row < h; row++)
++                        memcpy(input + row * w, src + (y0 + row) * width + x0, w * sizeof *src);
++                    crt_filter_apply_3x(input, w, h, w, beam, blur);
++                    pitch = w * 3;
++                    result = beam + (y - y0) * 3 * pitch + (x - x0) * 3;
++                }
++                for (int row = 0; row < tile_h * 3; row++)
++                    memcpy(dst + ((y * 3 + row) * width + x) * 3,
++                           result + row * pitch, tile_w * 3 * sizeof *dst);
++            }
++        }
++        memcpy(current->glass, dst, (size_t)width * height * 9 * sizeof *dst);
++    }
++    memcpy(current->picture, src, (size_t)width * height * sizeof *src);
++    current->valid = 1;
++    cache->next = 1 - cache->next;
++}

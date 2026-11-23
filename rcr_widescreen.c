@@ -1,7 +1,7 @@
 /* Experimental River City Ransom USA E9C387EC widescreen mod:
  * world-space presentation and visibility.
- * All graphics are read from the verified owner ROM at runtime. No ROM data
- * or generated assets are part of this source file. See docs/WIDESCREEN.md. */
+ * Guest graphics come from the verified owner ROM at runtime. The optional
+ * Konoko costume has its own hand-drawn tiles. See docs/WIDESCREEN.md. */
 #include "rcr_widescreen.h"
 #include "nes_runtime.h"
 #include "nes_video.h"
@@ -15,7 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define ROOMS 35
+#define ROOMS RCR_MAP_ROOMS
 #define OBJECTS 7
 #define TILES_PER_OBJECT 128
 #define MAX_PAGES 5
@@ -45,12 +45,14 @@ static uint32_t s_list_pending;
 static uint8_t s_rom[PRG_SIZE + CHR_SIZE];
 static int s_ready, s_enabled = 1;
 static NesAspectMode s_aspect = NES_ASPECT_FIT;
-static int s_room = -1, s_pages, s_left, s_right, s_view, s_camera;
-static int s_resident;
-static uint8_t s_tiles[MAX_PAGES * 32][30];
-static uint8_t s_attributes[MAX_PAGES * 32][30];
-static uint8_t s_page_palette[MAX_PAGES], s_page_chr[MAX_PAGES];
-static uint8_t s_resident_nt[2048], s_resident_chr[2];
+static int s_room = -1, s_view, s_camera;
+typedef struct {
+    int pages, resident;
+    uint8_t tiles[MAX_PAGES * 32][30], attributes[MAX_PAGES * 32][30];
+    uint8_t page_palette[MAX_PAGES], page_chr[MAX_PAGES];
+    uint8_t resident_nt[2048], resident_chr[2];
+} Terrain;
+static Terrain live_terrain;
 static uint8_t s_opaque[NES_MAX_RENDER_WIDTH * 240];
 static uint64_t s_wide_frames, s_decode_errors, s_collision_reads, s_activation_reads, s_spawn_reads;
 static unsigned s_terrain_pixels,s_terrain_diffs;
@@ -64,10 +66,13 @@ static int native_camera(void) {
     return cam+delta;
 }
 static int world_x(int obj) { return (int16_t)(g_ram[0x83+obj] | (g_ram[0x8c+obj] << 8)); }
-static int gameplay(void) {
+static int street_scene(void) {
     return s_ready && g_ram[0x42] < ROOMS && g_ram[0x41] == 0 &&
-           g_ram[0x40] && (g_ram[0x48] & 0x80) && !(g_ram[0x3e] & 0x40) &&
+           g_ram[0x40] && !(g_ram[0x3e] & 0x40) &&
            !(g_ram[0x36] & 0x40);
+}
+static int gameplay(void) {
+    return street_scene() && (g_ram[0x48] & 0x80);
 }
 static int pause_panel(void) {
     /* The native full-submenu palettes use $0C in buffer $0110; the world
@@ -84,13 +89,82 @@ static uint8_t prg(int bank, unsigned addr) {
 }
 static unsigned word(int bank, unsigned addr) { return prg(bank, addr) | (prg(bank, addr+1) << 8); }
 
+int rcr_map_current_room(void) {
+    /* A shop or NES submenu retains its parent street in $42. */
+    return s_ready && g_ram[0x40] && (g_ram[0x48]&0x80) && g_ram[0x42]<ROOMS ? g_ram[0x42] : -1;
+}
+
+int rcr_map_objective_room(void) {
+    if (rcr_map_current_room()<0 || (g_ram[0x38]&0x20)) return -1;
+    /* A route through the required encounters. Bank 4 $B502 maps rooms to
+     * their waves, $B717 checks prerequisites, and bank 6 $A510 records
+     * victories using the $A55F pairs (flag byte offset, mask). Both
+     * Dragon Twins must fall before Slick. Slick triggers the ending via
+     * $38 bit 5 at $9DB7 instead of setting a persistent defeat bit. */
+    static const struct { uint8_t room, boss; } route[] = {
+        {11,0x0c}, /* Rocko */
+        {4,0x0f},  /* Blade */
+        {15,0x0b}, /* Turk */
+        {16,0x0a}, /* Mojo */
+        {22,0x10}, /* Thor */
+        {28,0x12}, /* Ivan */
+        {29,0x11}, /* Otis */
+        {32,0x14}, {32,0x15} /* Dragon Twins */
+    };
+    for (size_t i=0;i<sizeof route/sizeof route[0];++i) {
+        unsigned entry=0xa55f+2*(route[i].boss-9);
+        if (!(g_ram[0x44+prg(6,entry)] & prg(6,entry+1))) return route[i].room;
+    }
+    return 34; /* Slick, on the roof */
+}
+
+uint64_t rcr_map_exits(int room) {
+    if (!s_ready || (unsigned)room>=ROOMS) return 0;
+    /* Bank 1, $9E9D: room -> list of exit triggers. $9FAE distinguishes
+     * shop actions from transitions and reads the destination entrance ID. */
+    unsigned list=word(1,0xa748+2*room);
+    uint64_t exits=0;
+    for (int i=0; i<32; ++i) {
+        unsigned trigger=word(1,list+i*2);
+        if (trigger<0x8000 || trigger>=0xc000) break;
+        if (prg(1,trigger)&0x80) continue;
+        unsigned entry=prg(1,trigger+1);
+        if (entry>=73) continue;
+        unsigned dest=prg(1,0xa43d+5*entry);
+        if (dest<ROOMS && dest!=(unsigned)room) exits |= UINT64_C(1)<<dest;
+    }
+    return exits;
+}
+
+void rcr_map_name(int room, char name[32]) {
+    int n=0;
+    if (s_ready && (unsigned)room<ROOMS) {
+        unsigned id=prg(1,0x9cbb+room);
+        if (id>=0x37 && id<=0x44) {
+            unsigned ptr=word(3,0xb200+2*id);
+            for (int i=0; i<40 && n<31; ++i) {
+                unsigned c=prg(3,ptr+i);
+                if (c==5) break;
+                if (c>=0xc0 && c<0xda) name[n++]='A'+c-0xc0;
+                else if (c>=0xda && c<0xf4) name[n++]='a'+c-0xda;
+                else if (c>=0xf4 && c<=0xfd) name[n++]='0'+c-0xf4;
+                else if (c==0xb4) name[n++]='-';
+                else if (c==0xb6) name[n++]='.';
+                else if (c==0 && n && name[n-1]!=' ') name[n++]=' ';
+            }
+        }
+    }
+    while (n && name[n-1]==' ') --n;
+    name[n]=0;
+}
+
 static uint8_t screen_byte(unsigned bank, unsigned addr) {
     if (addr>=0x8000) return prg((int)bank,addr);
     unsigned offset=PRG_SIZE+bank*1024+addr-0x1000;
     return addr>=0x1000 && addr<0x2000 && offset<sizeof s_rom ? s_rom[offset] : 0;
 }
 /* C7F2..C928: bounded resident-screen bytecode, including substreams. */
-static int screen_stream(unsigned bank, unsigned *src, unsigned *dst, int depth, int *budget) {
+static int screen_stream(uint8_t *nametables, unsigned bank, unsigned *src, unsigned *dst, int depth, int *budget) {
     if (depth>8) return 0;
     while (--*budget>0) {
         unsigned cmd=screen_byte(bank,(*src)++);
@@ -101,7 +175,7 @@ static int screen_stream(unsigned bank, unsigned *src, unsigned *dst, int depth,
             if ((hi&0xf0)==0x20) *dst=(hi<<8)|lo;
             else {
                 unsigned sub=(hi<<8)|lo;
-                if (!screen_stream(bank,&sub,dst,depth+1,budget)) return 0;
+                if (!screen_stream(nametables,bank,&sub,dst,depth+1,budget)) return 0;
             }
             continue;
         }
@@ -115,7 +189,7 @@ static int screen_stream(unsigned bank, unsigned *src, unsigned *dst, int depth,
             for (unsigned i=0;i<count;i++) {
                 if (--*budget<=0) return 0;
                 if (cmd&0x40) value=screen_byte(bank,(*src)++);
-                if (*dst>=0x2000 && *dst<0x2800) s_resident_nt[*dst-0x2000]=(uint8_t)value;
+                if (*dst>=0x2000 && *dst<0x2800) nametables[*dst-0x2000]=(uint8_t)value;
                 (*dst)++;
             }
         }
@@ -128,11 +202,9 @@ static int screen_stream(unsigned bank, unsigned *src, unsigned *dst, int depth,
  * of tiles, C41C streams the attributes; both reference owner-ROM bank 0..3.
  * C959's resident-screen records supply the other backgrounds. Directory
  * allocation separates paired scenes from centered single-screen scenes. */
-static void decode_room(void) {
-    s_room = g_ram[0x42]; s_pages = 0; s_left = 0; s_right = 256; s_resident=0;
-    memset(s_tiles, 0, sizeof s_tiles);
-    memset(s_attributes, 0, sizeof s_attributes);
-    unsigned directory = 0xc599 + s_room * 3;
+static int decode_terrain(Terrain *t, int room_id) {
+    memset(t,0,sizeof *t);
+    unsigned directory = 0xc599 + room_id * 3;
     if (!(prg(7, directory+2) & 0x80)) {
         /* C000..C091 loads the resident C959 screen records into the two
          * horizontal nametables. Directory allocation distinguishes paired
@@ -142,95 +214,130 @@ static void decode_room(void) {
             unsigned next=prg(7,0xc59b+room*3);
             if (next>first && next<end) end=next;
         }
-        if (end-first==2) {
-            memset(s_resident_nt,0,sizeof s_resident_nt);
-            for (int p=1;p>=0;p--) {
+        int pages=end-first;
+        if (pages==2 || pages==1) {
+            for (int p=pages-1;p>=0;p--) {
                 unsigned desc=0xc959+(first+p)*6;
+                t->page_palette[p]=prg(7,desc+3);
                 unsigned src=word(7,desc), dst=0x2000;
                 int budget=16384;
-                if (!screen_stream(prg(7,desc+2),&src,&dst,0,&budget)) {
-                    s_decode_errors++; return;
+                if (!screen_stream(t->resident_nt,prg(7,desc+2),&src,&dst,0,&budget)) {
+                    return 0;
                 }
             }
             unsigned desc=0xc959+first*6;
-            s_resident_chr[0]=prg(7,desc+4)&0xfe;
-            s_resident_chr[1]=prg(7,desc+5)&0xfe;
-            s_resident=1; s_pages=2; s_right=512;
+            t->resident_chr[0]=prg(7,desc+4)&0xfe;
+            t->resident_chr[1]=prg(7,desc+5)&0xfe;
+            t->resident=1; t->pages=pages;
         }
-        return;
+        return t->pages>0;
     }
     unsigned first = word(7, directory), end = 0xc705;
     for (int room=0; room<ROOMS; room++) {
         unsigned p = word(7, 0xc599+room*3);
         if (p > first && p < end) end=p;
     }
-    if (first < 0xc602 || end <= first || (end-first)%7) { s_decode_errors++; return; }
-    s_pages = (int)((end-first)/7);
-    if (s_pages > MAX_PAGES) { s_pages=0; s_decode_errors++; return; }
+    if (first < 0xc602 || end <= first || (end-first)%7) return 0;
+    t->pages = (int)((end-first)/7);
+    if (t->pages > MAX_PAGES) return 0;
     /* The final corridor has four authored pages and a duplicate fifth page
      * for the native column stream's lookahead. The original right wall stops
      * Alex at X=1015. Cache capacity must not become another visible room. */
-    if (s_room==0x20 && s_pages==5 &&
+    if (room_id==0x20 && t->pages==5 &&
         !memcmp(s_rom+0x1c000+first-0xc000+21,
-                s_rom+0x1c000+first-0xc000+28,7)) s_pages=4;
-    for (int p=0; p<s_pages; p++) {
+                s_rom+0x1c000+first-0xc000+28,7)) t->pages=4;
+    for (int p=0; p<t->pages; p++) {
         unsigned desc = first+p*7;
         unsigned rows = word(7,desc), attrs = word(7,desc+2);
         int bank = prg(7,desc+6)&3;
-        s_page_palette[p] = prg(7,desc+4);
-        s_page_chr[p] = prg(7,desc+5);
+        t->page_palette[p] = prg(7,desc+4);
+        t->page_chr[p] = prg(7,desc+5);
         for (int y=4; y<24; y++) {
             unsigned row = word(bank,rows+y*2);
             if (row < 0x8000 || row > 0xbfe0 || attrs < 0x8000 || attrs > 0xbfc0) {
-                s_pages=0; s_decode_errors++; return;
+                return 0;
             }
             for (int x=0; x<32; x++) {
-                s_tiles[p*32+x][y] = prg(bank,row+x);
+                t->tiles[p*32+x][y] = prg(bank,row+x);
                 uint8_t a = prg(bank,attrs+(y/4)*8+x/4);
-                s_attributes[p*32+x][y] = (a >> (((y&2)*2)+(x&2))) & 3;
+                t->attributes[p*32+x][y] = (a >> (((y&2)*2)+(x&2))) & 3;
             }
         }
     }
-    s_right = s_pages*256;
+    return 1;
+}
+static void decode_room(void) {
+    s_room=g_ram[0x42];
+    if (!decode_terrain(&live_terrain,s_room)) {
+        live_terrain.pages=0;
+        ++s_decode_errors;
+    }
+    /* The game presents single-screen interiors in the native compositor. */
+    if (live_terrain.resident && live_terrain.pages==1) live_terrain.pages=0;
 }
 static int view_left(int cam, int width) {
     int left = cam-(width-256)/2;
-    if (s_right-s_left <= width) return s_left-(width-(s_right-s_left))/2;
-    if (left < s_left) left=s_left;
-    if (left > s_right-width) left=s_right-width;
+    int room_width=live_terrain.pages ? live_terrain.pages*256 : 256;
+    if (room_width <= width) return -(width-room_width)/2;
+    if (left < 0) left=0;
+    if (left > room_width-width) left=room_width-width;
     return left;
 }
-static uint32_t bg_pixel(int wx, int y, int *opaque) {
+static uint32_t terrain_pixel(const Terrain *t,int wx,int y,int *opaque,int live) {
     *opaque=0;
-    if (wx < s_left || wx >= s_right || y<32 || y>=192) return 0xff000000u;
-    if (s_resident) {
-        unsigned nt=(wx/256)*1024, tx=(wx&255)/8, ty=y/8;
-        unsigned tile=s_resident_nt[nt+ty*32+tx];
-        unsigned attr=s_resident_nt[nt+960+(ty/4)*8+tx/4];
-        unsigned pal=(attr>>((ty&2)*2+(tx&2)))&3;
-        unsigned row=PRG_SIZE+s_resident_chr[tile/128]*1024+(tile%128)*16+(y&7), shift=7-(wx&7);
-        if (row+8>=sizeof s_rom) return 0xff000000u;
-        unsigned pixel=((s_rom[row]>>shift)&1)|(((s_rom[row+8]>>shift)&1)<<1);
-        *opaque=pixel!=0;
-        return g_nes_palette[g_ppu_pal[pixel?pal*4+pixel:0]&63];
+    if (wx < 0 || wx >= t->pages*256 || y<32 || y>=192) return 0xff000000u;
+    int p=wx/256, pal;
+    unsigned offset;
+    if (t->resident) {
+        unsigned nt=p*1024, tx=(wx&255)/8, ty=y/8;
+        unsigned tile=t->resident_nt[nt+ty*32+tx];
+        unsigned attr=t->resident_nt[nt+960+(ty/4)*8+tx/4];
+        pal=(attr>>((ty&2)*2+(tx&2)))&3;
+        offset=PRG_SIZE+t->resident_chr[tile/128]*1024+(tile%128)*16+(y&7);
+    } else {
+        int tile=t->tiles[wx/8][y/8];
+        pal=t->attributes[wx/8][y/8];
+        offset=PRG_SIZE+(t->page_chr[p]&0xfe)*1024+tile*16+(y&7);
     }
-    int p=wx/256, tile=s_tiles[wx/8][y/8], pal=s_attributes[wx/8][y/8];
-    unsigned offset = PRG_SIZE+(s_page_chr[p]&0xfe)*1024+tile*16+(y&7);
-    if (offset+8 >= sizeof s_rom) return 0xff000000u;
-    int shift=7-(wx&7);
-    int pixel=((s_rom[offset]>>shift)&1)|(((s_rom[offset+8]>>shift)&1)<<1);
+    if (offset+8>=sizeof s_rom) return 0xff000000u;
+    int bit=7-(wx&7);
+    int pixel=((s_rom[offset]>>bit)&1)|(((s_rom[offset+8]>>bit)&1)<<1);
     *opaque=pixel!=0;
     int color;
-    if (s_page_palette[p] == g_ram[0x518]) color=g_ppu_pal[pixel ? pal*4+pixel : 0];
+    if (live && (t->resident || t->page_palette[p]==g_ram[0x518])) color=g_ppu_pal[pixel ? pal*4+pixel : 0];
     else {
-        unsigned palette=word(7,0xe6f1+s_page_palette[p]*2);
+        unsigned palette=word(7,0xe6f1+t->page_palette[p]*2);
         color=prg(7,palette+(pixel ? pal*4+pixel : 0));
-        if ((g_ram[0x3e]&2) && g_ram[0x692]<4 && color!=0x0f) {
+        if (live && (g_ram[0x3e]&2) && g_ram[0x692]<4 && color!=0x0f) {
             int brightness=g_ram[0x692]*16;
             if ((color&0x30)>=brightness) color=(color&15)|brightness;
         }
     }
     return g_nes_palette[color&63];
+}
+
+static uint32_t bg_pixel(int wx,int y,int *opaque) {
+    return terrain_pixel(&live_terrain,wx,y,opaque,1);
+}
+
+/* Fit the whole 160-line playfield into the card, preserving proportions.
+ * Average a 3x3 grid per output pixel so fine brickwork and signage survive. */
+void rcr_map_panorama(int room,uint32_t *out,int stride,int width,int height) {
+    if (!s_ready || (unsigned)room>=ROOMS) return;
+    Terrain t;
+    if (!decode_terrain(&t,room)) return;
+    int world=t.pages*256;
+    int w=SDL_min(width,world*height/160), h=SDL_min(height,160*width/world);
+    out+=(height-h)/2*stride+(width-w)/2;
+    for (int y=0;y<h;++y) for (int x=0;x<w;++x) {
+        unsigned r=0,g=0,b=0;
+        for (int j=1;j<6;j+=2) for (int i=1;i<6;i+=2) {
+            int opaque;
+            uint32_t c=terrain_pixel(&t,(6*x+i)*world/(6*w),32+(6*y+j)*160/(6*h),&opaque,0);
+            r+=(c>>16)&255; g+=(c>>8)&255; b+=c&255;
+        }
+        out[y*stride+x]=0xff000000u|(r/9<<16)|(g/9<<8)|(b/9);
+    }
 }
 
 /* Hair and facial outlines share ink #1. These hand-selected regions in
@@ -257,12 +364,199 @@ static const uint8_t hair_region[256][8] = {
     [0xa2]={255,255,255,255,255,0xf3,255,0xf0}, [0xa7]={255,255,255,255,0x1f,0x1f,0x1f,0x1f},
 };
 /* Encode independent player owners in the low two bits (shirt) and next
- * two bits (hair). The same tags travel with native and repaired OAM. */
-enum { SHIRT = 1, HAIR = 4 };
+ * two bits (face), followed by two bits each for pants and the full costume. The same tags travel with native and repaired OAM. */
+enum { SHIRT = 1, HAIR = 4, PANTS = 16, BODY = 64 };
 static uint8_t appearance_tag(const Sprite *s, int obj) {
     int owner=s->carried_owner ? s->carried_owner : obj+1;
     return owner<=2 ? owner*s->regions : 0;
 }
+/* Each crown is drawn at a different angle in the ROM. Describe its
+ * exposed edge in tile space, before the metasprite's horizontal/vertical
+ * flip. Tiles containing just the lower fringe keep their original shape. */
+enum { UPRIGHT=1, LOWERED, SIDE_RIGHT, SIDE_LEFT };
+static const uint8_t crown_edge[256] = {
+    [0x00]=UPRIGHT,[0x01]=UPRIGHT,[0x60]=UPRIGHT,[0x61]=UPRIGHT,
+    [0x40]=UPRIGHT,[0x41]=UPRIGHT,[0x62]=UPRIGHT,[0x63]=UPRIGHT,
+    [0x09]=LOWERED,[0x0a]=LOWERED,[0x90]=LOWERED,[0x91]=LOWERED,
+    [0x64]=LOWERED,[0x65]=LOWERED,[0x1e]=UPRIGHT,[0x1f]=UPRIGHT,
+    [0x9e]=UPRIGHT,[0x9f]=UPRIGHT,[0x45]=UPRIGHT,[0x46]=UPRIGHT,
+    [0x77]=UPRIGHT,[0x78]=UPRIGHT,[0x49]=UPRIGHT,[0x4a]=SIDE_RIGHT,
+    [0x67]=SIDE_RIGHT,[0x93]=UPRIGHT,[0xd5]=SIDE_RIGHT,
+    [0xa2]=SIDE_LEFT,[0xa7]=SIDE_RIGHT,[0x0d]=UPRIGHT
+};
+
+int rcr_hair_style(int player) {
+    int style=g_nes_config.hair_style[player];
+    return (unsigned)style<RCR_HAIR_STYLE_COUNT ? style : 0;
+}
+/* Entries 0..9 retain their original config indices. The nine street
+ * faces are assigned to gang members by slot ($B6A9), independently of
+ * the gang's name. The Dragon Twins share one face bank. */
+typedef struct {
+    const char *name;
+    int bank, variant;
+    uint8_t head[4]; /* NPC upper-left/right and lower-left/right tiles */
+    int eye_y, mirror;
+} FaceSource;
+static const FaceSource faces[]={
+    {.name="Original"}, {.name="Crew cut"}, {.name="Spikes"},
+    {"Moose",84,.variant=2}, {"Mojo",85,.variant=3}, {"Turk",86,.variant=2}, {"Rocko",87,.variant=3},
+    {"Blade",90,.variant=2}, {"Thor",91,.variant=3}, {"Otis",100,.variant=2},
+    {"Alex",0,.variant=0}, {"Ryan",0,.variant=1},
+    {"Street 1",66,.variant=2}, {"Street 2",67,.variant=2}, {"Street 3",68,.variant=2},
+    {"Street 4",70,.variant=2}, {"Street 5",71,.variant=2}, {"Street 6",74,.variant=3},
+    {"Street 7",72,.variant=3}, {"Street 8",73,.variant=3}, {"Street 9",69,.variant=3},
+    {"Benny",88,.variant=2}, {"Clyde",89,.variant=3}, {"Ivan",105,.variant=4}, {"Tex",106,.variant=4},
+    {"Dragon Twins",110,.variant=4}, {"Slick",108,.variant=4},
+    /* Street NPC metasprites $13..$19 use CHR page 83. */
+    {"Roxy and Cyndi",83,-1,{28,29,44,45},.eye_y=7},
+    {"Townsperson 1",83,-1,{34,35,50,51},.eye_y=7},
+    {"Townsperson 2",83,-1,{36,37,52,53},.eye_y=7},
+    {"Townsperson 3",83,-1,{38,39,54,55},.eye_y=7},
+    {"Townsperson 4",83,-1,{20,21,22,23},.eye_y=7},
+    /* Shop actor types $1D..$25. Bank 2 $B0CE picks the metasprite,
+     * $B738/$B750 select its CHR pages. Align their eyes to fighter scale. */
+    {"Clerk 1",115,-1,{0,1,16,17},8,1}, {"Clerk 2",121,-1,{0,1,16,17},8,1},
+    {"Clerk 3",121,-1,{25,9,41,17},8,1}, {"Clerk 4",115,-1,{29,30,45,17},8,1},
+    {"Chef",119,-1,{0,1,16,17},7,1}, {"Clerk 5",119,-1,{6,7,16,17},7,1},
+    {"Clerk 6",119,-1,{8,9,16,17},7,1}, {"Clerk 7",119,-1,{11,12,43,44},.eye_y=6},
+    {"Secret shop",121,-1,{14,15,30,31},.eye_y=8},
+    {"Closed eyes",112,-1,{42,43,16,17},.eye_y=7}
+};
+enum { FACE_COUNT = sizeof faces / sizeof faces[0] };
+/* The shop expression adds closed eyes to Alex's existing hairstyle. */
+_Static_assert(FACE_COUNT==RCR_HAIR_STYLE_COUNT+1 && FACE_COUNT==RCR_EYE_STYLE_COUNT+2,
+               "face catalog size");
+
+int rcr_eye_style(int player) {
+    int style=g_nes_config.eyes[player];
+    return (unsigned)style<RCR_EYE_STYLE_COUNT ? style : 0;
+}
+const char *rcr_eye_style_name(int style) {
+    return faces[style>0 && style<RCR_EYE_STYLE_COUNT ? style+2 : 0].name;
+}
+const char *rcr_hair_style_name(int style) {
+    return faces[(unsigned)style<RCR_HAIR_STYLE_COUNT ? style : 0].name;
+}
+
+/* Copy only the donor rows needed by the compositor from the owner's ROM.
+ * Each record holds eight pose tiles in the game's two-bitplane format. */
+static uint8_t face_tiles[FACE_COUNT][8][16];
+static void load_faces(void) {
+    for (int style=3; style<FACE_COUNT; ++style) {
+        const FaceSource *f=&faces[style];
+        for (int pose=0;pose<8;++pose) {
+            uint8_t *out=face_tiles[style][pose];
+            if (f->variant>=0) {
+                unsigned tile=prg(7,0xef99+pose*5+f->variant);
+                static const unsigned player_pages[]={64,66,74,65};
+                unsigned bank=f->bank ? (unsigned)f->bank : player_pages[tile/64];
+                memcpy(out,s_rom+PRG_SIZE+bank*1024+(tile%64)*16,16);
+                continue;
+            }
+            memset(out,0,16);
+            for (int y=0;y<8;y++) for (int x=0;x<8;x++) {
+                int sx=x+(pose%2)*8, sy=y;
+                if (pose==4 || pose==5) sy-=2;
+                if (pose==6) sy+=6;
+                if (pose==7) { sx=15-y; sy=x; }
+                if (sy<0) continue;
+                sy=(sy*f->eye_y+3)/7;
+                if (f->mirror) sx=15-sx;
+                unsigned tile=f->head[(sy/8)*2+sx/8];
+                const uint8_t *chr=s_rom+PRG_SIZE+f->bank*1024+tile*16+(sy%8);
+                for (int plane=0;plane<2;plane++)
+                    out[y+plane*8] |= ((chr[plane*8]>>(7-sx%8))&1)<<(7-x);
+            }
+        }
+    }
+}
+
+/* Inverse of the two player columns of $EF99. These are the crown tiles
+ * the metasprite decoder substitutes by actor variant. Other poses reuse
+ * shared art, including the back of the head. Zero denotes a shared tile. */
+static const uint8_t crown_pose[256]={
+    [0x00]=1,[0x60]=1,[0x01]=2,[0x61]=2,
+    [0x40]=3,[0x62]=3,[0x41]=4,[0x63]=4,
+    [0x90]=5,[0x64]=5,[0x91]=6,[0x65]=6,
+    [0xa0]=7,[0x66]=7,[0x4a]=8,[0x67]=8
+};
+
+/* Eye sockets in unflipped tile space. Row offsets follow the
+ * lowered head and its continuation in the following tile. */
+static const uint8_t sockets[8][8]={
+    {0,0,0,0,0x03,0x1f,0x3f,0x3f},{0,0,0,0,0xe0,0xe0,0xe0,0xe0},
+    {0,0,0,0,0x0f,0x3f,0x3f,0x3f},{0,0,0,0,0x80,0x80,0x80,0x80},
+    {0,0,0,0,0,0,0x0f,0x3f},{0,0,0,0,0,0,0x80,0x80},
+    {0x3f,0x3f}, {0,0x70,0,0xc0,0xe0,0xe0,0xe0,0xe0}
+};
+
+#include "oni_sprite.h"
+
+void rcr_style_sprite_row(uint8_t tag,uint8_t tile,int row,uint8_t *lo,uint8_t *hi) {
+    if (g_nes_config.oni_mode && tag>>6) {
+        if (oni_has_tile(tile)) {
+            *lo=*hi=0;
+            for (int bit=0;bit<8;++bit) {
+                unsigned pen=oni_pen(oni_ink(tile,row,bit));
+                *lo |= (pen&1)<<bit;
+                *hi |= (pen>>1)<<bit;
+            }
+        }
+        return;
+    }
+    unsigned owner=(tag>>2)&3;
+    if (owner!=1 && owner!=2) return;
+    unsigned pose=crown_pose[tile];
+    int eyes=rcr_eye_style(owner-1);
+    uint8_t eye_mask=eyes && pose ? sockets[pose-1][row] : 0;
+    if (eye_mask) {
+        const uint8_t *eye=face_tiles[eyes+2][pose-1]+row;
+        uint8_t mask=eye_mask & (*lo|*hi) & (eye[0]|eye[8]);
+        *lo=(*lo & ~mask) | (eye[0] & mask);
+        *hi=(*hi & ~mask) | (eye[8] & mask);
+    }
+    int style=rcr_hair_style(owner-1);
+    if (!style) return;
+    if (style>=3) {
+        uint8_t mask=hair_region[tile][row] & ~eye_mask;
+        if (!pose || !mask) return;
+        const uint8_t *donor=face_tiles[style][pose-1]+row;
+        uint8_t donor_lo=donor[0], donor_hi=donor[8];
+        /* White ink below the crown is an eye in either face. Leave those
+         * pixels with the wearer. Ryan's glint lies in the top two rows. */
+        if (row>=(pose==5 || pose==6 ? 4 : 2))
+            mask &= ~((~*lo & *hi) | (~donor_lo & donor_hi));
+        *lo=(*lo & ~mask) | (donor_lo & mask);
+        *hi=(*hi & ~mask) | (donor_hi & mask);
+        return;
+    }
+    static const uint8_t top[2][8]={
+        {0xff,0xff,0x81}, {0xee,0xcc,0x88}
+    };
+    static const uint8_t side[2][8]={
+        {7,7,7,7,3,3,1,1}, {7,3,1,0,7,3,1,0}
+    };
+    uint8_t cut;
+    switch (crown_edge[tile]) {
+    case UPRIGHT: cut=top[style-1][row]; break;
+    case LOWERED: cut=row<2 ? 0 : top[style-1][row-2]; break;
+    case SIDE_RIGHT: cut=side[style-1][row]; break;
+    case SIDE_LEFT:
+        cut=side[style-1][row];
+        cut=((cut&1)<<7)|((cut&2)<<5)|((cut&4)<<3);
+        break;
+    default: return;
+    }
+    /* Ryan's crown glint includes one skin-colored highlight beside the
+     * white one. Keep every other skin pixel, including in fallen poses. */
+    int glint=((tile==0x60 || tile==0x62) && row==1) || (tile==0x64 && row==3);
+    uint8_t removable=(*lo ^ *hi) | (glint ? 0x10 : 0);
+    cut &= hair_region[tile][row] & removable & ~eye_mask;
+    *lo &= ~cut;
+    *hi &= ~cut;
+}
+
 static uint8_t shadow_tags[64], display_tags[64], coherent_tags[64];
 static const struct { const char *name; uint8_t color; } swatches[RCR_SWATCH_COUNT] = {
     {"Original",0}, {"Red",0x16}, {"Gold",0x28}, {"Green",0x1a}, {"Blue",0x12}, {"Violet",0x14}
@@ -278,10 +572,32 @@ uint8_t rcr_shirt_color(int owner, uint8_t original) {
         return swatches[choice].color;
     return original;
 }
-uint8_t rcr_sprite_color(uint8_t tag, uint8_t tile, int row, int bit, int pixel, uint8_t original) {
-    if (pixel==2) return rcr_shirt_color(tag & 3, original);
-    int owner=tag >> 2;
+uint8_t rcr_sprite_color(uint8_t tag, uint8_t tile, int row, int bit, int pixel, const uint8_t palette[4]) {
+    uint8_t original=palette[pixel]&63;
+    if (g_nes_config.oni_mode && tag>>6) {
+        /* Follow the guest subpalette during fades and damage flashes. */
+        if ((palette[3]&63)!=0x26) return original;
+        if (pixel==1 && original!=0x0f) return original;
+        if (pixel==2 && original!=0x11 && original!=0x30) return original;
+        if (oni_has_tile(tile)) {
+            char ink=oni_ink(tile,row,bit);
+            return oni_pen(ink)==(unsigned)pixel ? oni_color(ink,tag>>6,original) : original;
+        }
+        /* Dust clouds in the player animation table keep their guest palette. */
+        return original;
+    }
+    if (pixel==2) {
+        int pants=(tag>>4)&3;
+        if (pants && pants<=2 && original==(pants==1 ? 0x11 : 0x30)) {
+            int choice=g_nes_config.pants[pants-1];
+            if (choice>0 && choice<RCR_SWATCH_COUNT) return swatches[choice].color;
+        }
+        return rcr_shirt_color(tag & 3,original);
+    }
+    int owner=(tag>>2)&3;
     if (pixel==1 && owner>=1 && owner<=2 && original==0x0f && (hair_region[tile][row] & (1u<<bit))) {
+        int pose=crown_pose[tile];
+        if (pose && rcr_eye_style(owner-1) && (sockets[pose-1][row] & (1u<<bit))) return original;
         int choice=g_nes_config.hair[owner-1];
         if (choice>0 && choice<RCR_SWATCH_COUNT) return swatches[choice].color;
     }
@@ -400,12 +716,17 @@ static void decode_packet(Packet *out) {
                 ryan_attr=carried_ryan_attr;
             }
             s->carried_owner=(uint8_t)carried_owner;
-            int shirt = (carried_owner || type == 0) && alex_attr && (prg(3,alex_attr+n)&3)==0 &&
-                       (prg(3,ryan_attr+n)&3)==1;
+            int body=carried_owner || (!attachment && type==0);
+            int cloth=0;
+            if (body && alex_attr && ryan_attr) {
+                unsigned alex=prg(3,alex_attr+n)&3, ryan=prg(3,ryan_attr+n)&3;
+                if (alex==0 && ryan==1) cloth=SHIRT;
+                if (alex==1 && ryan==0) cloth=PANTS;
+            }
             static const uint8_t empty_region[8]={0};
-            int hair=(carried_owner || (!attachment && type==0)) &&
-                     memcmp(hair_region[tile],empty_region,sizeof empty_region);
-            s->regions=(shirt ? SHIRT : 0) | (hair ? HAIR : 0);
+            int hair=body &&
+                     (crown_pose[tile] || memcmp(hair_region[tile],empty_region,sizeof empty_region));
+            s->regions=cloth | (hair ? HAIR : 0) | (body ? BODY : 0);
             s->tile_source=tiles+n;
             s->attr_source=attr_ptr ? attr_ptr+n : 0;
             s->tile=(uint8_t)tile;
@@ -457,7 +778,7 @@ static int observe_sprite(uint16_t addr) {
 }
 static int suppress_sprite(int slot, int x, int y, void *user) {
     (void)slot; (void)x; (void)user;
-    return s_enabled && s_pages>0 && s_room==g_ram[0x42] &&
+    return s_enabled && live_terrain.pages>0 && s_room==g_ram[0x42] &&
            ppu_renderer_in_custom_native_pass() && gameplay() &&
            !pause_panel() &&
            (!g_ram[0x3f] || (y>=32 && y<192));
@@ -487,14 +808,16 @@ static void draw_packet(uint32_t *out, int width, const Packet *packet, int owne
             if (py<32 || py>=192) continue;
             int row=(s->attr&0x80)?7-y:y;
             int offset=0x1000+s->tile*16+row;
+            uint8_t lo=g_chr_ram[offset], hi=g_chr_ram[offset+8];
+            if (tag) rcr_style_sprite_row(tag,s->tile,row,&lo,&hi);
             for (int x=0; x<8; x++) {
                 int px=s->x-s_view+x;
                 if (px<0 || px>=width) continue;
                 int bit=(s->attr&0x40)?x:7-x;
-                int c=((g_chr_ram[offset]>>bit)&1)|(((g_chr_ram[offset+8]>>bit)&1)<<1);
+                int c=((lo>>bit)&1)|(((hi>>bit)&1)<<1);
                 if (!c || ((s->attr&0x20)&&s_opaque[py*width+px])) continue;
-                uint8_t color=g_ppu_pal[0x10+(s->attr&3)*4+c]&63;
-                if (tag) color=rcr_sprite_color(tag,s->tile,row,bit,c,color);
+                const uint8_t *palette=g_ppu_pal+0x10+(s->attr&3)*4;
+                uint8_t color=tag ? rcr_sprite_color(tag,s->tile,row,bit,c,palette) : palette[c]&63;
                 out[py*width+px]=g_nes_palette[color];
             }
         }
@@ -526,7 +849,7 @@ static int render(uint32_t *out, int width, int height, int native_x0,
     }
     if (!gameplay()) return 0;
     if (s_room!=g_ram[0x42]) decode_room();
-    if (!s_pages) return 0;
+    if (!live_terrain.pages) return 0;
     /* Native pixels use this frame's scroll. The wide viewport follows the
      * camera sampled with the displayed actor list, including repeated DMAs. */
     s_camera=native_camera(); s_view=view_left(s_actors.present_camera,width);
@@ -575,7 +898,7 @@ uint8_t rcr_ws_read(uint16_t pc, uint16_t addr, uint8_t value) {
     }
     if (!s_enabled || !gameplay() || g_render_width<=256 || (addr!=0xdc && addr!=0xdd)) return value;
     if (s_room!=g_ram[0x42]) decode_room();
-    if (!s_pages) return value;
+    if (!live_terrain.pages) return value;
     int origin=0,handled=0;
     if (g_current_bank==4 && (pc==0x82d6 || pc==0x82de)) {
         /* Hitboxes are translated into a common local frame per object pair,
@@ -678,21 +1001,32 @@ static int state_set(const uint8_t *buf, int len) {
 }
 static int shirt_state_get(uint8_t *buf, int cap) {
     if (cap < 193) return -1;
-    buf[192]=1;
+    buf[192]=3;
     memcpy(buf,shadow_tags,64); memcpy(buf+64,display_tags,64); memcpy(buf+128,coherent_tags,64);
     return 193;
 }
 static int shirt_state_set(const uint8_t *buf, int size) {
-    if (size==192) {
-        /* Older saves only owned shirt ink. Retain the reconstructed hair tags. */
+    if (size==192 || (size==193 && (buf[192]==1 || buf[192]==2))) {
+        /* Retain newly reconstructed regions missing from the older tag format. */
+        int version=size==192 ? 0 : buf[192];
         for (int i=0;i<64;i++) {
-            shadow_tags[i]=(shadow_tags[i]&12)|(buf[i]&3);
-            display_tags[i]=(display_tags[i]&12)|(buf[64+i]&3);
-            coherent_tags[i]=(coherent_tags[i]&12)|(buf[128+i]&3);
+            uint8_t *tags[]={shadow_tags,display_tags,coherent_tags};
+            for (int k=0;k<3;k++) {
+                uint8_t saved=buf[k*64+i];
+                /* Some formerly untagged tiles now carry the lower eyes. */
+                int mask=version==2 ? 63 : version==1 && (saved&12) ? 15 : 3;
+                uint8_t tag=(tags[k][i]&~mask)|(saved&mask);
+                /* A repaired slot can be hidden in OAM at load time.
+                 * Its saved clothing or face tag still identifies its owner. */
+                unsigned region=saved & mask;
+                unsigned owner=(region | (region>>2) | (region>>4)) & 3;
+                if (owner==1 || owner==2) tag=(tag&63) | owner*BODY;
+                tags[k][i]=tag;
+            }
         }
         return 1;
     }
-    if (size!=193 || buf[192]!=1) return 0;
+    if (size!=193 || buf[192]!=3) return 0;
     memcpy(shadow_tags,buf,64); memcpy(display_tags,buf+64,64); memcpy(coherent_tags,buf+128,64);
     return 1;
 }
@@ -702,6 +1036,7 @@ void rcr_ws_init(const char *rom_path) {
     int ok=fseek(f,16,SEEK_SET)==0 && fread(s_rom,1,sizeof s_rom,f)==sizeof s_rom;
     fclose(f);
     if (!ok) { fprintf(stderr,"[Widescreen] Incomplete owner ROM\n"); return; }
+    load_faces();
     s_ready=1;
     nes_video_on_window_resized(1280,720);
     nes_mod_register_function_entry_plugin("rcr.widescreen.metasprite",0xed0e,observe_sprite);
@@ -728,13 +1063,81 @@ int rcr_ws_debug(const char *cmd, int id, const char *json) {
     }
     if (strcmp(cmd,"rcr_widescreen")) return 0;
     debug_server_send_fmt("{\"id\":%d,\"ok\":true,\"width\":%d,\"room\":%d,\"pages\":%d,\"camera\":%d,\"view\":%d,\"wide_frames\":%llu,\"decode_errors\":%llu,\"collision_reads\":%llu,\"activation_reads\":%llu,\"spawn_reads\":%llu,\"sprites\":[%u,%u,%u,%u,%u,%u,%u],\"terrain_pixels\":%u,\"terrain_diffs\":%u,\"pause_panel\":%u}",
-        id,g_render_width,s_room,s_pages,s_camera,s_view,(unsigned long long)s_wide_frames,
+        id,g_render_width,s_room,live_terrain.pages,s_camera,s_view,(unsigned long long)s_wide_frames,
         (unsigned long long)s_decode_errors,(unsigned long long)s_collision_reads,
         (unsigned long long)s_activation_reads,(unsigned long long)s_spawn_reads,
         s_actors.present[0].count,s_actors.present[1].count,s_actors.present[2].count,
         s_actors.present[3].count,s_actors.present[4].count,s_actors.present[5].count,s_actors.present[6].count,
         s_terrain_pixels,s_terrain_diffs,(unsigned)pause_panel());
     return 1;
+}
+
+/* Keep the guest's name and stamina pixels together with its live wallet.
+ * The native HUD occupies rows 16..23. Its following tile row is available
+ * for totals when a narrow Fit window cannot fit both totals inline. */
+enum { HUD_Y = 16, HUD_ROWS = 16, WALLET_SPACE = 64 };
+static uint32_t native_hud[HUD_ROWS][256];
+static unsigned wallet_players;
+
+static void draw_wallet_hud(uint32_t *out, int width) {
+    if (!wallet_players) return;
+    int origin = (width - 256) / 2;
+    int gap = width >= 256 + 2 * WALLET_SPACE ? WALLET_SPACE : 0;
+    for (int row = 0; row < HUD_ROWS; ++row) {
+        uint32_t *line = out + (HUD_Y + row) * width;
+        const uint32_t *native = native_hud[row];
+        for (int x = 0; x < width; ++x) line[x] = native[0];
+        if (gap && row < 8) {
+            /* Insert a field after each name and before its stamina bar. */
+            memcpy(line + origin - gap, native, 64 * sizeof *line);
+            memcpy(line + origin + 64, native + 64, 112 * sizeof *line);
+            memcpy(line + origin + 176 + gap, native + 176, 80 * sizeof *line);
+        } else {
+            memcpy(line + origin, native, 256 * sizeof *line);
+        }
+    }
+    if (width == 256) return;
+    for (int player = 0; player < 2; ++player) {
+        if (!(wallet_players & (1u << player))) continue;
+        /* Bank 0 $BAFE..$BB64 prints three packed-BCD dollars digits and
+         * two cents digits. P2's wallet starts three bytes after P1's. */
+        const uint8_t *wallet = g_ram + 0x4c7 + player * 3;
+        unsigned dollars = (wallet[2] & 15) * 100 + (wallet[1] >> 4) * 10 + (wallet[1] & 15);
+        unsigned cents = (wallet[0] >> 4) * 10 + (wallet[0] & 15);
+        char amount[12];
+        snprintf(amount, sizeof amount, "$%u.%02u", dollars, cents);
+        int x = origin + (gap ? 64 - gap : 24) + player * (112 + gap);
+        int y = HUD_Y + (gap ? 0 : 8);
+        for (const char *c = amount; *c; ++c, x += 8) {
+            for (int row = 0; row < 8; ++row) {
+                unsigned bits = rcr_font_row(*c, row);
+                for (int bit = 0; bit < 8; ++bit)
+                    if (bits & (128u >> bit)) out[(y + row) * width + x + bit] = g_nes_palette[0x37];
+            }
+        }
+    }
+}
+
+void rcr_wallet_frame(uint32_t *frame, int width) {
+    wallet_players = 0;
+    /* Select slides in the NES money HUD. Let it and the Start menu own
+     * their native layouts throughout their transitions. */
+    if (!street_scene() || g_ram[0x3f] || g_ram[0xde] || (g_ram[0x3e] & 2)) return;
+    int origin = (width - 256) / 2;
+    for (int row = 0; row < HUD_ROWS; ++row)
+        memcpy(native_hud[row], frame + (HUD_Y + row) * width + origin, sizeof native_hud[row]);
+    for (int player = 0; player < 2; ++player) {
+        if (!(g_ram[0x48 + player] & 0x80)) continue;
+        /* Wait for the actual name to appear after a fade or room load. */
+        int name = 24 + player * 112;
+        for (int row = 0; row < 8 && !(wallet_players & (1u << player)); ++row)
+            for (int x = name; x < name + 40; ++x)
+                if (native_hud[row][x] != native_hud[row][0]) {
+                    wallet_players |= 1u << player;
+                    break;
+                }
+    }
+    if (width > 256) draw_wallet_hud(frame, width);
 }
 
 /* Fill newly revealed columns from the same guest frame. Retain the exact
@@ -745,7 +1148,7 @@ void game_pause_preview(uint32_t *out, int width, const uint32_t *frozen, int ol
         memcpy(out, frozen, (size_t)width * 240 * sizeof(*out));
         return;
     }
-    int world = gameplay() && s_pages && !pause_panel();
+    int world = gameplay() && live_terrain.pages && !pause_panel();
     int old_view = old_width == 256 ? native_camera() : view_left(s_actors.present_camera, old_width);
     int new_view = width == 256 ? native_camera() : view_left(s_actors.present_camera, width);
     if (world) {
@@ -772,6 +1175,7 @@ void game_pause_preview(uint32_t *out, int width, const uint32_t *frozen, int ol
         if (count > 0)
             memcpy(out+y*width+dst, frozen+y*old_width+src, (size_t)count*sizeof(*out));
     }
+    draw_wallet_hud(out, width);
 }
 
 /* Game lettering and rotated selection triangle from the owner's CHR bank 3. */
@@ -780,8 +1184,10 @@ uint8_t rcr_font_row(char c, int row) {
     if (c >= 'A' && c <= 'Z') tile = c-'A';
     else if (c >= 'a' && c <= 'z') tile = 26+c-'a';
     else if (c >= '0' && c <= '9') tile = 52+c-'0';
+    else if (c == '$') tile = 62;
     else if (c == '+') return row==3?0x7c:row>0&&row<6?0x10:0;
     else if (c == '-') return row==3?0x7c:0;
+    else if (c == '.') return row==6 ? 0x18 : 0;
     else if (c == ',') return row==5?0x18:row==6?0x10:row==7?0x20:0;
     else if (c == '(' || c == ')') {
         static const uint8_t parens[8]={0x08,0x10,0x20,0x20,0x20,0x10,0x08,0};
@@ -813,13 +1219,18 @@ void rcr_standing_preview(uint32_t *out, int stride, int x, int y, int player) {
         Sprite *s=&pose.tiles[i];
         unsigned bank=s->tile<64 ? 64 : 66;
         const uint8_t *tile=s_rom+PRG_SIZE+bank*1024+(s->tile%64)*16;
-        for (int dy=0;dy<8;++dy) for(int dx=0;dx<8;++dx) {
-            int row=(s->attr&128)?7-dy:dy, bit=(s->attr&64)?dx:7-dx;
-            int c=((tile[row]>>bit)&1)|(((tile[row+8]>>bit)&1)<<1);
-            if (!c) continue;
-            uint8_t color=palette[s->attr&1][c];
-            color=rcr_sprite_color(appearance_tag(s,player),s->tile,row,bit,c,color);
-            out[(y+s->y+dy)*stride+x+s->x+dx]=g_nes_palette[color];
+        uint8_t tag=appearance_tag(s,player);
+        for (int dy=0;dy<8;++dy) {
+            int row=(s->attr&128)?7-dy:dy;
+            uint8_t lo=tile[row], hi=tile[row+8];
+            rcr_style_sprite_row(tag,s->tile,row,&lo,&hi);
+            for (int dx=0;dx<8;++dx) {
+                int bit=(s->attr&64)?dx:7-dx;
+                int c=((lo>>bit)&1)|(((hi>>bit)&1)<<1);
+                if (!c) continue;
+                uint8_t color=rcr_sprite_color(tag,s->tile,row,bit,c,palette[s->attr&1]);
+                out[(y+s->y+dy)*stride+x+s->x+dx]=g_nes_palette[color];
+            }
         }
     }
 }

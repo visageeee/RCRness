@@ -131,12 +131,46 @@ int main(void) {
     assert(rcr_shirt_color(2,0x11)==0x28);
     assert(rcr_shirt_color(2,0x30)==0x30);
     assert(rcr_shirt_color(1,0x30)==0x30);
+    const uint8_t normal[]={0,0x0f,0x30,0x26}, blue[]={0,0x0f,0x11,0x26};
+    const uint8_t flash[]={0,0x30,0x16,0x26}, dark[]={0,0x0f,0x0f,0x0f};
     g_nes_config.hair[0]=3;
-    assert(rcr_sprite_color(HAIR,0,0,6,1,0x0f)==0x1a);
-    assert(rcr_sprite_color(HAIR,0,7,6,1,0x0f)==0x0f);
-    assert(rcr_sprite_color(HAIR,0,0,6,3,0x26)==0x26);
-    assert(rcr_sprite_color(HAIR,0,0,6,1,0x30)==0x30);
-    assert(rcr_sprite_color(0,0,0,6,1,0x0f)==0x0f);
+    assert(rcr_sprite_color(HAIR,0,0,6,1,normal)==0x1a);
+    assert(rcr_sprite_color(HAIR,0,7,6,1,normal)==0x0f);
+    assert(rcr_sprite_color(HAIR,0,0,6,3,normal)==0x26);
+    assert(rcr_sprite_color(HAIR,0,0,6,1,flash)==0x30);
+    assert(rcr_sprite_color(0,0,0,6,1,normal)==0x0f);
+    g_nes_config.pants[0]=3;
+    g_nes_config.pants[1]=5;
+    assert(rcr_sprite_color(PANTS,0x30,0,3,2,blue)==0x1a);
+    assert(rcr_sprite_color(2*PANTS,0x30,0,3,2,normal)==0x14);
+    assert(rcr_sprite_color(PANTS,0x30,0,3,2,flash)==0x16);
+    assert(rcr_sprite_color(0,0x30,0,3,2,blue)==0x11);
+    for (int panel=1;panel<=ONI_FALL_LOWER;panel++)
+        for (int row=0;row<8;row++) assert(strlen(oni_panels[panel][row])==16);
+    for (int tile=0;tile<256;tile++) {
+        if (!oni_motion_tiles[tile]) continue;
+        assert(strlen(oni_motion_tiles[tile])==64);
+        assert(!oni_tiles[tile]); /* Every movement tile has one source of art. */
+    }
+    const uint8_t stride_and_kick[]={4,5,6,0x18,0x19,0x1a,0x28,0x29,0x2a,0x39,0x3a};
+    for (unsigned i=0;i<sizeof stride_and_kick;i++) assert(oni_has_tile(stride_and_kick[i]));
+    assert(!oni_has_tile(0x5e) && !oni_has_tile(0xe5));
+    g_nes_config.oni_mode=1;
+    for (int obj=0;obj<3;obj++) {
+        Sprite head={.regions=BODY|HAIR};
+        uint8_t tag=appearance_tag(&head,obj), lo=255, hi=0;
+        rcr_style_sprite_row(tag,0,0,&lo,&hi);
+        assert(lo==(obj<2 ? 8 : 255) && hi==0);
+        assert(rcr_sprite_color(tag,0,0,3,1,normal)==(obj<2 ? 0x24 : 0x0f));
+        assert(rcr_sprite_color(tag,0,0,3,1,dark)==0x0f);
+    }
+    /* Restore a v2 repaired slot without a visible OAM entry to match. */
+    memset(saved,0,193);
+    saved[128+3]=2*PANTS;
+    saved[192]=2;
+    assert(shirt_state_set(saved,193));
+    assert(coherent_tags[3]==2*(PANTS|BODY));
+    assert(shirt_state_get(saved,sizeof saved)==193 && saved[192]==3);
     puts("sprite lifecycle, scroll alignment and appearance: PASS");
     return 0;
 }

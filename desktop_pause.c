@@ -8,18 +8,21 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef enum { MAIN, OPTIONS, CONTROLS, CHARACTERS, CONFIRM_QUIT, CAPTURE, CONFLICT, DEFAULTS } Page;
-typedef enum { NONE, UP, DOWN, LEFT, RIGHT, ACCEPT, BACK } Action;
+typedef enum { MAIN, OPTIONS, CONTROLS, CHARACTERS, CITY_MAP, CONFIRM_QUIT, CAPTURE, CONFLICT, DEFAULTS } Page;
+typedef enum { NONE, UP, DOWN, LEFT, RIGHT, ACCEPT, BACK, ZOOM } Action;
 typedef struct {
     Page page;
     int row, match, player, pad, input, conflict_player, conflict_action, confirm;
+    int map_room, map_zoom_toggle;
     const char *notice;
 } Menu;
 static const int action_order[]={4,5,6,7,0,1,3,2};
 static const char *const action_names[]={"Punch","Kick","Select","Start","Up","Down","Left","Right"};
 static int binding_action(const Menu *m) { return action_order[m->row-1]; }
 
-static const char *const main_rows[] = {"Resume", "Options", "Controls", "Characters", "Quit game"};
+static const Page main_pages[]={MAIN, OPTIONS, CONTROLS, CHARACTERS, CITY_MAP, CONFIRM_QUIT};
+enum { MAIN_COUNT = sizeof(main_pages)/sizeof(main_pages[0]) };
+static const char *const main_rows[MAIN_COUNT] = {"Resume", "Options", "Controls", "Characters", "Map", "Quit game"};
 static const char *const option_rows[] = {"Widescreen", "CRT filter", "Reduce sprite flicker"};
 static const char *const quit_rows[] = {"Cancel", "Quit game"};
 static const struct { NesAspectMode mode; const char *label; } aspects[] = {
@@ -52,14 +55,18 @@ static void change_option(int row, int direction) {
 enum { PANEL_WIDTH = 252, PANEL_HEIGHT = 216 };
 static const uint32_t paper = 0xffebeee8, ink = 0xff081018, accent = 0xfff8c460;
 
-static void lettering(uint32_t *pixels, int x, int y, const char *text, uint32_t color) {
+static void draw_letters(uint32_t *pixels, int stride, int x, int y, const char *text, uint32_t color) {
     for (; *text; ++text, x += 8) {
         for (int row = 0; row < 8; ++row) {
             unsigned bits = rcr_font_row(*text, row);
             for (int col = 0; col < 8; ++col)
-                if (bits & (128u >> col)) pixels[(y+row)*PANEL_WIDTH+x+col] = color;
+                if (bits & (128u >> col)) pixels[(y+row)*stride+x+col] = color;
         }
     }
+}
+
+static void lettering(uint32_t *pixels,int x,int y,const char *text,uint32_t color) {
+    draw_letters(pixels,PANEL_WIDTH,x,y,text,color);
 }
 
 /* Long device and binding names can occupy the full detail line. */
@@ -69,7 +76,7 @@ static void field(uint32_t *p, int x, int y, const char *value, int chars, uint3
     lettering(p,x,y,buf,color);
 }
 static int selected_swatch(const Menu *m) {
-    int choice=(m->row==2 ? g_nes_config.hair : g_nes_config.outfit)[m->player];
+    int choice=(m->row==5 ? g_nes_config.pants : m->row==2 ? g_nes_config.hair : g_nes_config.outfit)[m->player];
     return (unsigned)choice<RCR_SWATCH_COUNT ? choice : 0;
 }
 
@@ -110,34 +117,232 @@ static void characters_panel(uint32_t *p, const Menu *m) {
     for(int i=0;i<2;++i) {
         int x=18+104*i;
         rcr_standing_preview(p,PANEL_WIDTH,x+39,68,i);
-        lettering(p,x,83,i?"Ryan (P2)":"Alex (P1)",paper);
-        if (m->player==i) lettering(p,x-10,83,">",accent);
+        if (g_nes_config.oni_mode) lettering(p,x,83,i?"Konoko P2":"Konoko P1",paper);
+        else lettering(p,x,83,i?"Ryan (P2)":"Alex (P1)",paper);
+        if (!g_nes_config.oni_mode && m->player==i) lettering(p,x-10,83,">",accent);
     }
-    if (m->row) lettering(p,8,m->row==2 ? 122 : 109,">",accent);
+    int mode_y=g_nes_config.oni_mode ? 109 : 174;
+    lettering(p,20,mode_y,"Oni mode",paper);
+    lettering(p,118,mode_y,g_nes_config.oni_mode?"On":"Off",accent);
+    if (g_nes_config.oni_mode) {
+        lettering(p,8,mode_y,">",accent);
+        return;
+    }
+    if (m->row) lettering(p,8,109+13*(m->row-1),">",accent);
     lettering(p,20,109,"Shirt",paper);
-    lettering(p,85,109,rcr_swatch_name(g_nes_config.outfit[m->player]),accent);
-    lettering(p,20,122,"Hair",paper);
-    lettering(p,85,122,rcr_swatch_name(g_nes_config.hair[m->player]),accent);
+    lettering(p,118,109,rcr_swatch_name(g_nes_config.outfit[m->player]),accent);
+    lettering(p,20,122,"Hair color",paper);
+    lettering(p,118,122,rcr_swatch_name(g_nes_config.hair[m->player]),accent);
+    lettering(p,20,135,"Hair style",paper);
+    lettering(p,118,135,rcr_hair_style_name(rcr_hair_style(m->player)),accent);
+    lettering(p,20,148,"Eyes",paper);
+    lettering(p,118,148,rcr_eye_style_name(rcr_eye_style(m->player)),accent);
+    lettering(p,20,161,"Pants",paper);
+    lettering(p,118,161,rcr_swatch_name(g_nes_config.pants[m->player]),accent);
+    if (m->row==3 || m->row==4 || m->row==6) return;
     for(int i=0;i<RCR_SWATCH_COUNT;++i) {
         int x=21+i*30;
         for(int y=0;y<16;++y) for(int dx=0;dx<22;++dx) {
             int border=dx==0||dx==21||y==0||y==15;
             int inner=dx==1||dx==20||y==1||y==14;
-            p[(139+y)*PANEL_WIDTH+x+dx]=border?(choice==i?paper:ink):inner?ink:rcr_swatch_color(m->player,i,m->row==2);
+            p[(189+y)*PANEL_WIDTH+x+dx]=border?(choice==i?paper:ink):inner?ink:rcr_swatch_color(m->row==5 ? !m->player : m->player,i,m->row==2);
         }
     }
 }
 
-static void draw_menu(SDL_Renderer *r, SDL_Texture *texture, Menu menu) {
+/* Schematic positions only. Connections and names come from the ROM. */
+static const struct { int col, y; } city_nodes[RCR_MAP_ROOMS] = {
+    {0,0},{1,0},{2,0},{3,0},{3,1},{4,0},{5,0},{6,0},{6,1},{7,0},
+    {7,2},{6,2},{5,2},{4,2},{3,2},{2,2},{1,2},{0,2},
+    {0,3},{1,3},{2,3},{3,3},{4,3},{5,3},{6,3},{7,3},
+    {7,4},{6,4},{5,4},{4,4},{3,4},{2,4},{1,4},{0,4},{1,5}
+};
+
+enum { CELL_W=128, CELL_H=72, ATLAS_W=CELL_W*8, ATLAS_H=CELL_H*6 };
+static SDL_Rect area_card(int room) {
+    return (SDL_Rect){city_nodes[room].col*CELL_W+8,city_nodes[room].y*CELL_H+4,CELL_W-16,CELL_H-10};
+}
+
+static void atlas_fill(uint32_t *pixels,SDL_Rect rect,uint32_t color) {
+    for (int y=rect.y;y<rect.y+rect.h;++y)
+        for (int x=rect.x;x<rect.x+rect.w;++x) pixels[y*ATLAS_W+x]=color;
+}
+
+static SDL_Texture *create_city_atlas(SDL_Renderer *renderer) {
+    uint32_t *pixels=malloc(ATLAS_W*ATLAS_H*sizeof *pixels);
+    if (!pixels) return NULL;
+    atlas_fill(pixels,(SDL_Rect){0,0,ATLAS_W,ATLAS_H},ink);
+    for (int i=0;i<RCR_MAP_ROOMS;++i) {
+        SDL_Rect a=area_card(i);
+        uint64_t exits=rcr_map_exits(i);
+        for (int j=i+1;j<RCR_MAP_ROOMS;++j) if (exits & (UINT64_C(1)<<j)) {
+            SDL_Rect b=area_card(j);
+            SDL_Rect line={SDL_min(a.x,b.x)+a.w/2,SDL_min(a.y,b.y)+22,
+                           abs(a.x-b.x)+2,abs(a.y-b.y)+2};
+            atlas_fill(pixels,line,0xff91a5ac);
+        }
+    }
+    for (int i=0;i<RCR_MAP_ROOMS;++i) {
+        SDL_Rect card=area_card(i);
+        char name[32];
+        rcr_map_name(i,name);
+        if (strstr(name,"Mall")) {
+            SDL_Rect frame={card.x-2,card.y-2,card.w+4,card.h+4};
+            atlas_fill(pixels,frame,0xff409cff);
+            /* Inset the card so the blue remains visible under both outlines. */
+            frame=(SDL_Rect){card.x+2,card.y+2,card.w-4,card.h-4};
+            atlas_fill(pixels,frame,0xff172632);
+        } else atlas_fill(pixels,card,0xff172632);
+        rcr_map_panorama(i,pixels+(card.y+2)*ATLAS_W+card.x+2,ATLAS_W,card.w-4,40);
+        if (!*name) snprintf(name,sizeof name,"Area %02d",i+1);
+        /* Two centered caption lines fit the longest original place name. */
+        char *second=NULL;
+        if (strlen(name)>14) {
+            second=name+14;
+            while (second>name && *second!=' ') --second;
+            if (second>name) *second++=0;
+            else second=NULL;
+        }
+        int y=card.y+(second?43:48);
+        draw_letters(pixels,ATLAS_W,card.x+(card.w-(int)strlen(name)*8)/2,y,name,paper);
+        if (second) draw_letters(pixels,ATLAS_W,card.x+(card.w-(int)strlen(second)*8)/2,y+9,second,paper);
+    }
+    SDL_Texture *texture=SDL_CreateTexture(renderer,SDL_PIXELFORMAT_ARGB8888,
+                                            SDL_TEXTUREACCESS_STATIC,ATLAS_W,ATLAS_H);
+    if (texture && SDL_UpdateTexture(texture,NULL,pixels,ATLAS_W*sizeof *pixels)<0) {
+        SDL_DestroyTexture(texture);
+        texture=NULL;
+    }
+    free(pixels);
+    return texture;
+}
+
+static void map_outline(SDL_Renderer *r,int room,SDL_Rect src,SDL_Rect dst,int margin) {
+    if (room<0) return;
+    SDL_Rect card=area_card(room);
+    SDL_Rect box={dst.x+(card.x-src.x-margin)*dst.w/src.w,
+                  dst.y+(card.y-src.y-margin)*dst.h/src.h,
+                  (card.w+2*margin)*dst.w/src.w,(card.h+2*margin)*dst.h/src.h};
+    SDL_RenderDrawRect(r,&box);
+}
+
+static int objective_lit(void) { return SDL_GetTicks()%1000 < 650; }
+
+static void draw_objective(SDL_Renderer *r,int room,SDL_Rect src,SDL_Rect dst,int unit) {
+    SDL_Rect card=area_card(room);
+    int x=dst.x+(card.x+card.w/2-src.x)*dst.w/src.w;
+    int y=dst.y+(card.y+22-src.y)*dst.h/src.h;
+    int radius=4*unit;
+    for (int dy=-radius;dy<=radius;++dy) {
+        int half=radius-abs(dy);
+        SDL_SetRenderDrawColor(r,8,16,24,255);
+        SDL_RenderDrawLine(r,x-half,y+dy,x+half,y+dy);
+        if (half>=unit) {
+            SDL_SetRenderDrawColor(r,255,104,112,255);
+            SDL_RenderDrawLine(r,x-half+unit,y+dy,x+half-unit,y+dy);
+        }
+    }
+}
+
+static void draw_city_map(SDL_Renderer *r,SDL_Texture *text,SDL_Texture **atlas,const Menu *m) {
+    if (!*atlas) *atlas=create_city_atlas(r);
+    int w,h;
+    SDL_RenderGetLogicalSize(r,&w,&h);
+    int unit=SDL_max(1,h/240);
+    SDL_Rect panel={4*unit,4*unit,w-8*unit,h-8*unit};
+    SDL_Rect window={panel.x+4*unit,panel.y+19*unit,panel.w-8*unit,panel.h-47*unit};
+    Uint8 red,green,blue,alpha;
+    SDL_GetRenderDrawColor(r,&red,&green,&blue,&alpha);
+    SDL_SetRenderDrawColor(r,8,16,24,255);
+    SDL_RenderFillRect(r,&panel);
+    SDL_SetRenderDrawColor(r,235,238,232,255);
+    SDL_RenderDrawRect(r,&panel);
+    SDL_Rect src={0,0,ATLAS_W,ATLAS_H};
+    float sx,sy;
+    SDL_RenderGetScale(r,&sx,&sy);
+    int detail=(window.w*sx<820 || window.h*sy<346) != m->map_zoom_toggle;
+    if (detail) {
+        SDL_Rect card=area_card(m->map_room);
+        src.w=SDL_min(ATLAS_W,window.w/unit);
+        src.h=SDL_min(ATLAS_H,window.h/unit);
+        src.x=SDL_clamp(card.x+card.w/2-src.w/2,0,ATLAS_W-src.w);
+        src.y=SDL_clamp(card.y+card.h/2-src.h/2,0,ATLAS_H-src.h);
+    }
+    SDL_Rect dst=window;
+    if (dst.w*src.h>dst.h*src.w) dst.w=dst.h*src.w/src.h;
+    else dst.h=dst.w*src.h/src.w;
+    dst.x+=(window.w-dst.w)/2;
+    dst.y+=(window.h-dst.h)/2;
+    int here=rcr_map_current_room();
+    int objective=rcr_map_objective_room();
+    if (*atlas) {
+        SDL_RenderCopy(r,*atlas,&src,&dst);
+        SDL_Rect old_clip;
+        SDL_bool clipped=SDL_RenderIsClipEnabled(r);
+        SDL_RenderGetClipRect(r,&old_clip);
+        SDL_RenderSetClipRect(r,&dst);
+        map_outline(r,m->map_room,src,dst,3);
+        SDL_SetRenderDrawColor(r,248,196,96,255);
+        map_outline(r,here,src,dst,1);
+        if (objective>=0 && objective_lit()) draw_objective(r,objective,src,dst,unit);
+        SDL_RenderSetClipRect(r,clipped?&old_clip:NULL);
+    }
+    SDL_SetRenderDrawColor(r,red,green,blue,alpha);
+    char name[32],heading[64],location[32];
+    rcr_map_name(m->map_room,name);
+    snprintf(heading,sizeof heading,"%02d  %s",m->map_room+1,*name?name:"City map");
+    if (here>=0) snprintf(location,sizeof location,"Here %02d",here+1);
+    else SDL_strlcpy(location,"No active location",sizeof location);
+    uint32_t captions[PANEL_WIDTH*24];
+    for (size_t i=0;i<sizeof captions/sizeof *captions;++i) captions[i]=ink;
+    field(captions,0,0,heading,30,paper);
+    lettering(captions,0,8,location,accent);
+    if (objective>=0) {
+        char goal[16];
+        snprintf(goal,sizeof goal,"Next %02d",objective+1);
+        lettering(captions,80,8,goal,0xffff6870);
+    }
+    lettering(captions,184,8,"Mall",0xff409cff);
+    lettering(captions,0,16,"Tab or X: zoom   Enter: home",paper);
+    SDL_Rect lines={0,0,PANEL_WIDTH,24};
+    SDL_UpdateTexture(text,&lines,captions,PANEL_WIDTH*sizeof *captions);
+    lines.h=8;
+    SDL_Rect band={panel.x+6*unit,panel.y+6*unit,SDL_min(PANEL_WIDTH,panel.w/unit-12)*unit,8*unit};
+    lines.w=band.w/unit;
+    SDL_RenderCopy(r,text,&lines,&band);
+    lines.y=8; lines.h=16; band.y=panel.y+panel.h-21*unit; band.h=16*unit;
+    SDL_RenderCopy(r,text,&lines,&band);
+}
+
+static void move_on_map(Menu *m,Action action) {
+    if (action==ZOOM) { m->map_zoom_toggle^=1; return; }
+    int here=rcr_map_current_room();
+    if (action==ACCEPT && here>=0) { m->map_room=here; return; }
+    int room=m->map_room;
+    uint64_t exits=rcr_map_exits(room);
+    for (int dest=0;dest<RCR_MAP_ROOMS;++dest) {
+        if (!(exits & (UINT64_C(1)<<dest))) continue;
+        int dx=city_nodes[dest].col-city_nodes[room].col;
+        int dy=city_nodes[dest].y-city_nodes[room].y;
+        if ((dx<0 && action==LEFT) || (dx>0 && action==RIGHT) ||
+            (dy<0 && action==UP) || (dy>0 && action==DOWN)) {
+            m->map_room=dest;
+            return;
+        }
+    }
+}
+
+static void draw_menu(SDL_Renderer *r, SDL_Texture *texture, SDL_Texture **atlas, Menu menu) {
     static uint32_t pixels[PANEL_WIDTH * PANEL_HEIGHT];
     int width=116, height=112;
     const char *title="Controls";
     switch(menu.page) {
-    case MAIN: title=menu.match?"Match menu":"Paused"; break;
+    case MAIN: height=128; title=menu.match?"Match menu":"Paused"; break;
     case OPTIONS: width=236; height=80; title="Options"; break;
     case CONFIRM_QUIT: height=64; title="Quit game?"; break;
+    case CITY_MAP: draw_city_map(r,texture,atlas,&menu); return;
     case CONTROLS: width=PANEL_WIDTH; height=PANEL_HEIGHT; break;
-    case CHARACTERS: width=212; height=167; title="Characters"; break;
+    case CHARACTERS: width=244; height=g_nes_config.oni_mode ? 132 : 212; title="Characters"; break;
     case CAPTURE: case DEFAULTS: case CONFLICT: width=248; height=94; break;
     }
     for (int y=0;y<height;++y) for(int x=0;x<width;++x)
@@ -161,7 +366,7 @@ static void draw_menu(SDL_Renderer *r, SDL_Texture *texture, Menu menu) {
             lettering(pixels,11,menu.confirm?70:52,">",accent);
         }
     } else {
-        int rows=menu.page==MAIN?5:menu.page==OPTIONS?3:2;
+        int rows=menu.page==MAIN?MAIN_COUNT:menu.page==OPTIONS?3:2;
         const char *const *labels=menu.page==MAIN?main_rows:menu.page==OPTIONS?option_rows:quit_rows;
         for(int i=0;i<rows;++i) {
             int y=28+16*i;
@@ -190,6 +395,7 @@ static void draw_menu(SDL_Renderer *r, SDL_Texture *texture, Menu menu) {
 static Action event_action(const SDL_Event *e) {
     if (e->type == SDL_KEYDOWN && !e->key.repeat) {
         switch (e->key.keysym.sym) {
+        case SDLK_TAB: return ZOOM;
         case SDLK_UP: return UP;
         case SDLK_DOWN: return DOWN;
         case SDLK_LEFT: return LEFT;
@@ -204,6 +410,7 @@ static Action event_action(const SDL_Event *e) {
         case SDL_CONTROLLER_BUTTON_DPAD_DOWN: return DOWN;
         case SDL_CONTROLLER_BUTTON_DPAD_LEFT: return LEFT;
         case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return RIGHT;
+        case SDL_CONTROLLER_BUTTON_X: return ZOOM;
         case SDL_CONTROLLER_BUTTON_A: return ACCEPT;
         case SDL_CONTROLLER_BUTTON_B: return BACK;
         }
@@ -226,6 +433,7 @@ static Action raw_action(const SDL_Event *e) {
     }
     int button = controller_raw_input(e->jbutton.which, e->jbutton.button);
     switch (button) {
+    case SDL_CONTROLLER_BUTTON_X: return ZOOM;
     case SDL_CONTROLLER_BUTTON_A: return ACCEPT;
     case SDL_CONTROLLER_BUTTON_B: return BACK;
     case SDL_CONTROLLER_BUTTON_DPAD_UP: return UP;
@@ -294,20 +502,23 @@ static int navigate(Menu *m, Action action) {
         }
         return 1;
     }
-    int rows=m->page==MAIN?5:m->page==CONTROLS?10:(m->page==OPTIONS || m->page==CHARACTERS)?3:2;
+    if (m->page==CITY_MAP && action!=BACK) { move_on_map(m,action); return 1; }
+    int rows=m->page==MAIN?MAIN_COUNT:m->page==CONTROLS?10:m->page==CHARACTERS?(g_nes_config.oni_mode?1:7):m->page==OPTIONS?3:2;
     if(action==UP || action==DOWN) m->row=(m->row+(action==DOWN?1:-1)+rows)%rows;
     if(action==BACK) {
         if(m->page==MAIN) return 0;
-        m->row=m->page==CONTROLS?2:m->page==CHARACTERS?3:m->page==CONFIRM_QUIT?4:1;
+        for (int i=0;i<MAIN_COUNT;++i)
+            if (main_pages[i]==m->page) { m->row=i; break; }
         m->page=MAIN; return 1;
     }
     int direction=action==LEFT?-1:action==RIGHT?1:0;
     switch(m->page) {
     case MAIN:
         if(action==ACCEPT) {
-            static const Page pages[]={MAIN,OPTIONS,CONTROLS,CHARACTERS,CONFIRM_QUIT};
             if(!m->row) return 0;
-            m->page=pages[m->row]; m->row=0; m->player=0; m->pad=0;
+            m->page=main_pages[m->row];
+            if (m->page==CITY_MAP) { int here=rcr_map_current_room(); m->map_room=here<0?0:here; }
+            m->row=0; m->player=0; m->pad=0;
         }
         break;
     case OPTIONS:
@@ -316,7 +527,7 @@ static int navigate(Menu *m, Action action) {
     case CONFIRM_QUIT:
         if(action==ACCEPT) {
             if(m->row) return -1;
-            m->page=MAIN; m->row=4;
+            m->page=MAIN; m->row=MAIN_COUNT-1;
         }
         break;
     case CONTROLS:
@@ -328,12 +539,25 @@ static int navigate(Menu *m, Action action) {
         break;
     case CHARACTERS:
         if(direction || action==ACCEPT) {
-            if(!m->row) m->player^=1;
-            else {
+            if(g_nes_config.oni_mode || m->row==6) {
+                g_nes_config.oni_mode=!g_nes_config.oni_mode;
+                config_save_display_setting(DISPLAY_ONI_MODE);
+                m->row=g_nes_config.oni_mode ? 0 : 6;
+            } else if(!m->row) m->player^=1;
+            else if (m->row==3) {
+                int style=rcr_hair_style(m->player);
+                g_nes_config.hair_style[m->player]=(style+(direction<0?-1:1)+RCR_HAIR_STYLE_COUNT)%RCR_HAIR_STYLE_COUNT;
+                config_save_display_setting(m->player?DISPLAY_RYAN_STYLE:DISPLAY_ALEX_STYLE);
+            } else if (m->row==4) {
+                int eye=rcr_eye_style(m->player);
+                g_nes_config.eyes[m->player]=(eye+(direction<0?-1:1)+RCR_EYE_STYLE_COUNT)%RCR_EYE_STYLE_COUNT;
+                config_save_display_setting(m->player?DISPLAY_RYAN_EYES:DISPLAY_ALEX_EYES);
+            } else {
                 int change=direction?direction:1;
-                int *choices=m->row==2 ? g_nes_config.hair : g_nes_config.outfit;
+                int *choices=m->row==5 ? g_nes_config.pants : m->row==2 ? g_nes_config.hair : g_nes_config.outfit;
                 choices[m->player]=(selected_swatch(m)+change+RCR_SWATCH_COUNT)%RCR_SWATCH_COUNT;
-                config_save_display_setting(m->row==2 ? (m->player?DISPLAY_RYAN_HAIR:DISPLAY_ALEX_HAIR) :
+                config_save_display_setting(m->row==5 ? (m->player?DISPLAY_RYAN_PANTS:DISPLAY_ALEX_PANTS) :
+                                            m->row==2 ? (m->player?DISPLAY_RYAN_HAIR:DISPLAY_ALEX_HAIR) :
                                                        (m->player?DISPLAY_RYAN_SHIRT:DISPLAY_ALEX_SHIRT));
             }
         }
@@ -352,12 +576,18 @@ void game_pause_menu(SDL_Window *window, SDL_Renderer *renderer, const uint32_t 
         SDL_TEXTUREACCESS_STREAMING, PANEL_WIDTH, PANEL_HEIGHT);
     if (!texture) { free(frozen); return; }
     memcpy(frozen, frame, bytes);
+    SDL_Texture *atlas=NULL;
     Menu menu = {.page = MAIN};
-    int dirty = 1, focused = 1;
+    int dirty = 1, focused = 1, last_lit = -1;
     for (;;) {
+        if (menu.page==CITY_MAP) {
+            int lit=objective_lit();
+            if (lit!=last_lit) dirty=1;
+            last_lit=lit;
+        }
         if (dirty) {
             draw_scene(frozen, width);
-            draw_menu(renderer, texture, menu);
+            draw_menu(renderer, texture, &atlas, menu);
             SDL_RenderPresent(renderer);
             dirty = 0;
         }
@@ -387,6 +617,7 @@ void game_pause_menu(SDL_Window *window, SDL_Renderer *renderer, const uint32_t 
             dirty = 1;
         }
     }
+    SDL_DestroyTexture(atlas);
     SDL_DestroyTexture(texture);
     free(frozen);
 }
@@ -394,13 +625,15 @@ void game_pause_menu(SDL_Window *window, SDL_Renderer *renderer, const uint32_t 
 #ifdef NESRECOMP_NET
 /* The network input pump owns the match clock. Handle one event at a time
  * there and composite over live frames until the player closes the menu. */
-static SDL_Texture *match_texture;
+static SDL_Texture *match_texture, *match_atlas;
 static Menu match_menu;
 
 int game_match_menu_active(void) { return match_texture != NULL; }
 
 void game_match_menu_close(void) {
     if (match_texture) SDL_DestroyTexture(match_texture);
+    SDL_DestroyTexture(match_atlas);
+    match_atlas=NULL;
     match_texture = NULL;
 }
 
@@ -422,6 +655,6 @@ int game_match_menu_event(SDL_Renderer *renderer, const SDL_Event *e, int focuse
 }
 
 void game_match_menu_draw(SDL_Renderer *renderer) {
-    if (match_texture) draw_menu(renderer, match_texture, match_menu);
+    if (match_texture) draw_menu(renderer, match_texture, &match_atlas, match_menu);
 }
 #endif

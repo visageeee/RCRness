@@ -125,7 +125,7 @@ void game_oam_dma_filter(uint8_t page, uint8_t oam[0x100]) {
 void game_run_nmi(void) { func_NMI(); }
 void game_run_main(void) { func_RESET(); }
 
-void game_post_render(uint32_t *framebuf) { (void)framebuf; }
+void game_post_render(uint32_t *framebuf) { rcr_wallet_frame(framebuf, g_render_width); }
 void game_fill_frame_record(void *record) { (void)record; }
 
 int game_handle_debug_cmd(const char *cmd, int id, const char *json) {

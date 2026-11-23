@@ -4,9 +4,11 @@
 
 - **Widescreen co-op fixes.** Fixed whole fighters flickering on the opening street and moving back and forth as the camera scrolled. Fighters stay visible as they cross the original viewport edge.
 - **Desktop pause menu.** Press **Esc** to pause local play, even inside the NES inventory screen. Use the keyboard or either controller to resume, change options, or quit. **Start** still opens the original menu for inventory, stats, and passwords.
+- **Widescreen wallets.** Each active fighter’s cash appears beside their name and stamina bar. Narrow Fit windows show it beneath the name.
 - **Display options.** Open **Esc → Options** to compare widescreen settings, the CRT filter, and sprite-flicker reduction on the frozen scene.
 - **Per-player controls.** Open **Esc → Controls** to see or change either player's keyboard and controller bindings. You can swap conflicting inputs and restore one player's defaults.
-- **Shirt and hair colors.** Open **Esc → Characters** to preview Alex and Ryan side by side. Choose each fighter's shirt and hair colors independently, or select **Original**. Your choices carry across restarts and save-state loads.
+- **Character customization.** In **Esc → Characters**, choose hair and eyes independently for Alex and Ryan from the players, street fighters, bosses, townspeople, and shopkeepers. Both fighters also have separate shirt, pants, and hair colors. Turn on **Oni mode** to dress both players as Konoko, with purple spikes, sunglasses, a fitted leather jacket, and riding pants. Selections carry across restarts and save-state loads.
+- **City map.** Open **Esc → Map** for a connected atlas of all 35 areas. Each label sits beneath a scaled panorama of the entire playfield. A gold outline marks your location, blue frames mark malls, and a blinking red diamond shows the next required boss. The **Next** number identifies the destination even when it is outside the zoomed view. Use the arrows or D-pad to explore, **Tab** or controller **X** to zoom, and **Enter** or controller confirm to return to your area.
 
 ## About RCRness
 
@@ -181,8 +183,8 @@ changes to `keybinds.ini`. Press Punch and Kick together to jump, or double-tap
 Left or Right to run.
 
 In **Characters**, use Left/Right to choose Alex or Ryan, then move down and
-choose a Shirt or Hair swatch. Both standing previews use the game artwork. Each
-color is saved separately in `config.ini` and applies when loading a save.
+choose shirt and pants colors, hair color, a hairstyle, or eyes. The standing previews show the active costume. Turning Oni mode off restores each player’s individual choices. Each
+choice is saved separately in `config.ini` and applies when loading a save.
 
 Display aspect ratio is selectable without changing the native framebuffer:
 
@@ -221,10 +223,9 @@ black. The image is aspect corrected before the phosphor mask is drawn, keeping
 the mask evenly spaced and avoiding wide interference bands in 4:3 mode. Native
 screenshots, diagnostics, and game state remain unchanged.
 
-The 4:3 resample is cached once per frame before beam reconstruction. This
-preserves the filtered pixels exactly while avoiding repeated interpolation of
-the same center and neighboring samples on lower-power CPUs and integrated
-graphics systems.
+The filter reuses finished blocks from the previous two frames when the source
+pixels and their neighbors match, including during horizontal scrolling. Changed
+blocks are filtered again with the same beam, slot mask, and bloom.
 
 - Press Ctrl+F7 in game to toggle it (persisted to `config.ini`).
 - Or launch with `--crt-filter` / `--no-crt-filter` for a one-run override.
