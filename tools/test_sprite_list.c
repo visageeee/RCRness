@@ -91,12 +91,12 @@ static void test_blood(void) {
     g_ram[0x6a]=0;
     g_ram[0x4c]=g_ram[0x4d]=g_ram[0x4e]=0x86;
     rcr_blood_hit(2,1);
-    assert(!head_items && street_items[0].head && headless_fighters==(1<<2));
+    assert(!head_items && street_items[0].kind && headless_fighters==(1<<2));
     for (int tick=0;tick<64;++tick) street_step();
     assert(street_items[0].height==0 && g_ram[0x4c]==0x86);
     rcr_object_replaced(2);
     /* A second successful finisher still drops with all guest slots busy. */
-    assert(drop_head(2,1) && street_items[1].head);
+    assert(drop_head(2,1) && street_items[1].kind);
     rcr_object_replaced(2);
     /* Full pool from a street fight: a loose weapon on either side of
      * Alex, with the middle slot held. Protect Ryan's nearby pickup too. */
@@ -125,7 +125,7 @@ static void test_blood(void) {
     int size=state_get(snapshot,sizeof snapshot);
     enter_street(1);
     assert(!street_items[1].type && state_set(snapshot,size));
-    assert(street_items[1].head && street_items[0].type==15);
+    assert(street_items[1].kind && street_items[0].type==15);
     uint8_t guest_snapshot[sizeof g_ram];
     memcpy(guest_snapshot,g_ram,sizeof guest_snapshot);
     for (int i=2;i<STREET_SLOTS;++i) {
@@ -139,7 +139,7 @@ static void test_blood(void) {
     assert(state_set(snapshot,size));
     g_ram[0x83]=210;
     street_step();
-    assert(g_ram[0xcb+6]==15 && !(head_items&(1<<6)) && street_items[0].head);
+    assert(g_ram[0xcb+6]==15 && !(head_items&(1<<6)) && street_items[0].kind);
     assert(state_set(snapshot,offsetof(ActorSave,street)) && !street_items[0].type);
     rcr_object_replaced(6);
     g_ram[0x4d]=0;
@@ -170,6 +170,62 @@ static void test_blood(void) {
     assert(lo==0x39 && hi==0x56); /* Turning gore off restores guest art. */
 }
 
+static void test_chainsaw(void) {
+    uint8_t original_ram[sizeof g_ram], saved[NES_MOD_SAVESTATE_BLOB_CAP];
+    memcpy(original_ram,g_ram,sizeof g_ram);
+    assert(spawn_saw(0));
+    street_step();
+    assert(has_saw(4));
+    g_ram[0x56]=0x40;
+    g_ram[0x3b7]=4;
+    /* Only the metasprite lookups for this carrier change. Both facings
+     * retain their mirror bit through carry, windup and extension. */
+    for (int facing=0;facing<=128;facing+=128) {
+        assert(rcr_saw_graphics_read(0xed3b,0xd3,facing|4)==facing);
+        assert(saw_pose(facing|8)==facing);
+        assert(saw_pose(facing|9)==(facing|7));
+        assert(rcr_saw_graphics_read(0xed3b,0xd3,facing|0x2c)==(facing|1));
+        assert(rcr_saw_graphics_read(0xed3b,0xd3,facing|0x2d)==(facing|0x2a));
+        assert(rcr_saw_graphics_read(0xed3b,0xd3,facing|0x7f)==(facing|0x7f));
+    }
+    /* Follow one bright tooth along each edge over a complete revolution
+     * of the four-pixel pattern. The housing moves by one pixel only. */
+    for (int phase=0;phase<4;++phase) {
+        g_ram[0x52b]=phase;
+        int shake=phase&1;
+        assert(saw_ink(HELD_SAW_ART+1,2+shake,7-phase)=='s');
+        assert(saw_ink(HELD_SAW_ART+1,6+shake,7-((4-phase)&3))=='s');
+        assert(saw_ink(HELD_SAW_ART,shake,6)=='#');
+        assert(saw_ink(SAW_ART,0,6)=='#');
+        if (shake) assert(saw_ink(HELD_SAW_ART,0,6)=='.');
+    }
+    assert(rcr_saw_graphics_read(0xee4f,0x3b0,6)==HAND_WEAPON_KIND);
+    assert(rcr_saw_graphics_read(0xee4f,0x3b1,6)==6);
+    g_ram[0x4f]=0xa3;
+    g_ram[0x85]=22;
+    g_nes_config.blood_effects=g_nes_config.persistent_bodies=1;
+    rcr_blood_hit(2,0);
+    assert(blood_drop_next==SAW_SPRAY);
+    rcr_clear_blood_spray();
+    rcr_enemy_coin(2);
+    g_ram[0x6f]=128;
+    cut_bodies();
+    assert(!bodies.body[0].cut);
+    g_ram[0x6f]=0;
+    cut_bodies();
+    cut_bodies();
+    assert(bodies.body[0].cut && blood_drop_next==SAW_SPRAY);
+    int size=bodies_get(saved,sizeof saved);
+    assert(bodies_set(saved,size) && bodies.body[0].cut);
+    assert(bodies_set(saved,sizeof bodies) && !bodies.body[0].cut);
+    rcr_clear_blood_spray();
+    rcr_object_replaced(4);
+    assert(!has_saw(4));
+    bodies.next=bodies.count=0;
+    g_nes_config.blood_effects=g_nes_config.persistent_bodies=0;
+    memcpy(g_ram,original_ram,sizeof g_ram);
+}
+
 static void test_persistent_bodies(void) {
     uint8_t saved[NES_MOD_SAVESTATE_BLOB_CAP];
     g_nes_config.persistent_bodies=0;
@@ -196,6 +252,7 @@ int main(void) {
     uint8_t saved[512];
     s_ready=1; s_enabled=1;
     g_ram[0x40]=1; g_ram[0x48]=0x80; g_ram[0x4b]=0x80;
+    test_chainsaw();
     test_persistent_bodies();
     test_blood();
     s_actors.room=0;

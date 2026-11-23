@@ -29,12 +29,15 @@ typedef struct { int16_t x, y; uint8_t tile, attr, carried_owner, regions, effec
 typedef struct {
     int16_t x, wy;
     uint32_t order;
-    uint8_t type, anim, variant, flags, held_by, held_state, held_kind, room, valid, head_item, headless;
+    uint8_t type, anim, variant, flags, held_by, held_state, held_kind, room, valid, item_art, headless;
 } Source;
 /* The last two flags use padding in the legacy 20-byte saved source. */
 _Static_assert(sizeof(Source)==20, "actor save source layout");
 typedef struct {
     Sprite tiles[TILES_PER_OBJECT];
+    /* Source addresses and signed ROM-space offsets of the two grip tiles.
+     * The native OAM builder reads the same offsets before flipping/clipping. */
+    struct { uint16_t offsets, tile; int8_t x,y; } saw_grip[2];
     Source source;
     uint16_t count;
     uint32_t order;
@@ -176,8 +179,18 @@ static int weapon_impact(void) {
 
 /* Bit per guest slot. An ordinary weapon remains responsible for all item
  * physics, AI, pickup, damage and throwing. Only its presentation is special. */
-static uint8_t head_items, headless_fighters;
+static uint8_t head_items, headless_fighters, saw_items, opening_saw;
+static int debug_saw_pending;
+enum { ITEM_STOCK, ITEM_HEAD, ITEM_SAW };
+enum { HEAD_LOOSE=1, HEAD_HELD, SAW_LOOSE, SAW_HELD };
+static int has_saw(int slot) {
+    return slot>=4 && slot<OBJECTS && (saw_items&(1u<<slot));
+}
+static int wielding_saw(int fighter) {
+    return (g_ram[0x56+fighter]&0x40) && has_saw(g_ram[0x3b7+fighter]);
+}
 void rcr_object_replaced(int obj) {
+    saw_items &= ~(1u<<obj);
     head_items &= ~(1u<<obj);
     headless_fighters &= ~(1u<<obj);
 }
@@ -187,7 +200,7 @@ void rcr_object_replaced(int obj) {
 typedef struct {
     int16_t x, lane, height;
     int8_t vx, vz;
-    uint8_t type, variant, anim, head;
+    uint8_t type, variant, anim, kind;
 } StreetWeapon;
 enum { STREET_SLOTS=8 };
 static StreetWeapon street_items[STREET_SLOTS];
@@ -226,7 +239,7 @@ static StreetWeapon resting_weapon(int slot) {
     if (!(g_ram[0x48+slot]&0x80)) return (StreetWeapon){0};
     return (StreetWeapon){.x=world_x(slot),.lane=g_ram[0x9e + slot]|(g_ram[0xa7+slot]<<8),
         .type=g_ram[0xcb+slot],.variant=g_ram[0x48+slot]&127,.anim=g_ram[0xd3+slot],
-        .head=(head_items>>slot)&1};
+        .kind=has_saw(slot) ? ITEM_SAW : (head_items>>slot)&1};
 }
 
 static int drop_head(int victim,int direction) {
@@ -246,7 +259,7 @@ static int drop_head(int victim,int direction) {
             street_items[spare]=(StreetWeapon){.x=world_x(victim),
                 .lane=g_ram[0x9e + victim]|(g_ram[0xa7+victim]<<8),
                 .height=20+g_ram[0xb9+victim]+(g_ram[0xc2+victim]<<8),
-                .vx=direction*2,.vz=4,.type=14,.variant=6,.head=1};
+                .vx=direction*2,.vz=4,.type=14,.variant=6,.kind=ITEM_HEAD};
             headless_fighters |= 1u<<victim;
             return 1;
         }
@@ -277,22 +290,15 @@ static int drop_head(int victim,int direction) {
     g_ram[0x3b7+slot]=(uint8_t)(attacker<4 ? attacker : victim);
     g_ram[0x6ed+slot]=1;
     g_ram[0x48+slot]=0x86;
+    rcr_object_replaced(slot);
     head_items |= 1u<<slot;
     headless_fighters |= 1u<<victim;
     return 1;
 }
 
-void rcr_blood_hit(int victim,int fatal) {
-    if (!g_nes_config.blood_effects || !gameplay() || pause_panel()) return;
-    blood_enter_room(g_ram[0x42]);
-    int x=world_x(victim);
-    int floor=240-(int16_t)(g_ram[0x9e + victim] | (g_ram[0xa7+victim]<<8));
-    int height=(int16_t)(g_ram[0xb9+victim] | (g_ram[0xc2+victim]<<8));
-    int direction=(g_ram[0xd3+victim]&0x80) ? -1 : 1;
+enum { SAW_SPRAY=640 };
+static void spray(int x,int floor,int height,int direction,unsigned drops,int weapon,int burst) {
     unsigned seed=(unsigned)(x+floor+blood_drop_next);
-    int weapon=weapon_impact();
-    int severed=fatal && weapon && drop_head(victim,direction);
-    unsigned drops=severed ? FINISHER_SPRAY : weapon ? WEAPON_SPRAY : HIT_SPRAY;
     for (unsigned i=0;i<drops;++i) {
         seed=seed*1664525u+1013904223u;
         int spread=(int)(seed>>28);
@@ -306,13 +312,70 @@ void rcr_blood_hit(int victim,int fatal) {
             d->vx+=direction*(int)((seed>>8)&15);
             d->vy-=(int)((seed>>12)&15);
         }
-        if (severed) {
+        if (burst) {
             d->vx=direction*(int)((seed>>9)&63)-direction*22;
             d->vy=-12-(int)((seed>>17)&55);
             d->x+=((int)(seed&7)-3)*8;
         }
         d->floor=floor+(int)((seed>>16)&15)-7;
     }
+}
+
+void rcr_blood_hit(int victim,int fatal) {
+    if (!g_nes_config.blood_effects || !gameplay() || pause_panel()) return;
+    blood_enter_room(g_ram[0x42]);
+    int x=world_x(victim);
+    int floor=240-(int16_t)(g_ram[0x9e + victim] | (g_ram[0xa7+victim]<<8));
+    int height=(int16_t)(g_ram[0xb9+victim] | (g_ram[0xc2+victim]<<8));
+    int direction=(g_ram[0xd3+victim]&0x80) ? -1 : 1;
+    int weapon=weapon_impact();
+    int severed=fatal && weapon && drop_head(victim,direction);
+    int attacker=g_ram[5];
+    int saw=weapon && (has_saw(attacker) || (attacker<4 && wielding_saw(attacker)));
+    unsigned drops=saw ? SAW_SPRAY : severed ? FINISHER_SPRAY : weapon ? WEAPON_SPRAY : HIT_SPRAY;
+    spray(x,floor,height,direction,drops,weapon,severed||saw);
+}
+
+static void place_ground_weapon(int slot,StreetWeapon item) {
+    /* Restore a settled item. Guest state $80 handles normal pickup and
+     * initializes carry/throw velocities when somebody takes the item. */
+    const unsigned clear[]={0x56,0x5d,0x64,0x6f,0x7a,0x95,0xb0,0xb9,0xc2,0x30f,
+        0x31d,0x325,0x32d,0x335,0x33d,0x345,0x34d,0x355,0x35d,0x365,0x36d,0x3b0,0x3b7};
+    for (unsigned i=0;i<sizeof clear/sizeof clear[0];++i) g_ram[clear[i]+slot]=0;
+    g_ram[0x83+slot]=(uint8_t)item.x; g_ram[0x8c+slot]=(uint16_t)item.x>>8;
+    g_ram[0x9e + slot]=(uint8_t)item.lane; g_ram[0xa7+slot]=(uint16_t)item.lane>>8;
+    g_ram[0xcb+slot]=item.type; g_ram[0xd3+slot]=item.anim;
+    g_ram[0x50b+slot]=g_ram[0x42]; g_ram[0x6ed+slot]=1;
+    g_ram[0x48+slot]=0x80|item.variant; g_ram[0x4f+slot]=0x80;
+    rcr_object_replaced(slot);
+    if (item.kind==ITEM_HEAD) head_items|=1u<<slot;
+    if (item.kind==ITEM_SAW) saw_items|=1u<<slot;
+}
+
+/* Spawn an ordinary pickable $0E item, with its chainsaw identity kept
+ * alongside the other custom artwork when the guest slots are busy. */
+static int spawn_saw(int offset) {
+    if (!gameplay() || pause_panel() || (g_ram[0x3e]&2)) return 0;
+#ifdef NESRECOMP_NET
+    if (nes_netplay_active()) return 0;
+#endif
+    enter_street(g_ram[0x42]);
+    StreetWeapon saw={.type=14,.variant=6,.anim=6,.kind=ITEM_SAW,
+        .x=world_x(0)+offset,.lane=g_ram[0x9e]|(g_ram[0xa7]<<8)};
+    int slot=ground_slot(-1);
+    if (slot>=0 && !(g_ram[0x48+slot]&0x80)) {
+        place_ground_weapon(slot,saw);
+        return 1;
+    }
+    for (int i=0;i<STREET_SLOTS;++i) {
+        if (street_items[i].type) continue;
+        if (slot>=0) {
+            street_items[i]=resting_weapon(slot);
+            place_ground_weapon(slot,saw);
+        } else street_items[i]=saw;
+        return 1;
+    }
+    return 0;
 }
 
 static void street_step(void) {
@@ -343,18 +406,7 @@ static void street_step(void) {
     if (old.type && distance>=player_distance(old.x,old.lane)) return;
     StreetWeapon item=street_items[nearest];
     street_items[nearest]=old;
-    /* Restore a settled item. Guest state $80 handles normal pickup and
-     * initializes carry/throw velocities when somebody takes the item. */
-    const unsigned clear[]={0x56,0x5d,0x64,0x6f,0x7a,0x95,0xb0,0xb9,0xc2,0x30f,
-        0x31d,0x325,0x32d,0x335,0x33d,0x345,0x34d,0x355,0x35d,0x365,0x36d,0x3b0,0x3b7};
-    for (unsigned i=0;i<sizeof clear/sizeof clear[0];++i) g_ram[clear[i]+slot]=0;
-    g_ram[0x83+slot]=(uint8_t)item.x; g_ram[0x8c+slot]=(uint16_t)item.x>>8;
-    g_ram[0x9e + slot]=(uint8_t)item.lane; g_ram[0xa7+slot]=(uint16_t)item.lane>>8;
-    g_ram[0xcb+slot]=item.type; g_ram[0xd3+slot]=item.anim;
-    g_ram[0x50b+slot]=g_ram[0x42]; g_ram[0x6ed+slot]=1;
-    g_ram[0x48+slot]=0x80|item.variant; g_ram[0x4f+slot]=0x80;
-    rcr_object_replaced(slot);
-    if (item.head) head_items|=1u<<slot;
+    place_ground_weapon(slot,item);
 }
 
 static void blood_step(void) {
@@ -839,8 +891,8 @@ static const uint8_t sockets[8][8]={
 
 /* $C0..$DF are outside the player outfit tag range. Four tiles make
  * the airborne head; the resting item has just two tiles in the guest OAM. */
-enum { HEAD_ART=192, HEAD_COMPACT=208, CUT_TOP=224, CUT_BOTTOM=232, HIDDEN=240,
-       MARK_HEAD=241, MARK_BODY=242 };
+enum { SAW_BLANK=175, SAW_ART=176, HEAD_ART=192, HEAD_COMPACT=208, CUT_TOP=224, CUT_BOTTOM=232, HIDDEN=240,
+       MARK_HEAD=241, MARK_BODY=242, MARK_SAW=243, HELD_SAW_ART=244, HELD_SAW_END=252 };
 static const char head_art[16][17]={
     "................",".....######.....","...##########...","..############..",
     "..#######ss###..","..##sss#ssss##..","..#s##ss##ss##..","..#sw#ssw#ss##..",
@@ -858,7 +910,48 @@ static char head_ink(uint8_t tag,int row,int bit) {
     return tag>=HEAD_COMPACT ? ground_head[y][x] : head_art[(part&2)*4+y][x];
 }
 
+/* Two NES tiles: orange motor housing, open handle, toothed steel bar.
+ * Vertical throws rotate the same artwork within the guest footprint. */
+static int saw_art_tag(int tag) {
+    return (tag>=SAW_BLANK && tag<HEAD_ART) || (tag>=HELD_SAW_ART && tag<HELD_SAW_END);
+}
+
+static char saw_ink(int tag,int row,int bit) {
+    static const char art[8][17]={
+        ".####...........",".#..#...........","######.#.#.#.#..",
+        "#oooo##########.","#o#oo#sssssssss#","#oooo##########.",
+        ".####..#.#.#.#..","................"};
+    if (tag==SAW_BLANK) return '.';
+    if (tag>=HELD_SAW_ART) {
+        /* Work in blade coordinates so the chain travels out along the top
+         * and back along the bottom, even when the carrier turns. $052B
+         * advances with guest updates and is restored with the game state. */
+        int part=tag-HELD_SAW_ART;
+        int x=8*(part&1)+((part&2)?bit:7-bit);
+        int phase=g_ram[0x52b]&3;
+        int y=((part&4)?7-row:row)-(phase&1);
+        if (y<0) return '.';
+        if (x>=6 && x<15 && (y==2 || y==6)) {
+            int tooth=(x+(y==2 ? 4-phase : phase))&3;
+            return tooth==0 ? 's' : tooth==1 ? '#' : '.';
+        }
+        return art[y][x];
+    }
+    int part=tag-SAW_ART;
+    int x=(part&4)?bit:7-bit, y=(part&8)?7-row:row;
+    return (part&2) ? art[7-x][(part&1)*8+y] : art[y][(part&1)*8+x];
+}
+
 void rcr_style_sprite_row(uint8_t tag,uint8_t tile,int row,uint8_t *lo,uint8_t *hi) {
+    if (saw_art_tag(tag)) {
+        *lo=*hi=0;
+        for (int bit=0;bit<8;++bit) {
+            char c=saw_ink(tag,row,bit);
+            if (c=='#' || c=='o') *lo|=1u<<bit;
+            if (c=='s' || c=='o') *hi|=1u<<bit;
+        }
+        return;
+    }
     if (tag>=HEAD_ART && !g_nes_config.blood_effects) return;
     if (tag>=CUT_TOP) {
         if (tag==HIDDEN || (tag<CUT_BOTTOM ? row<=(tag-CUT_TOP) : row>=7-(tag-CUT_BOTTOM))) *lo=*hi=0;
@@ -953,6 +1046,8 @@ uint8_t rcr_shirt_color(int owner, uint8_t original) {
 }
 uint8_t rcr_sprite_color(uint8_t tag, uint8_t tile, int row, int bit, int pixel, const uint8_t palette[4]) {
     uint8_t original=palette[pixel]&63;
+    if (saw_art_tag(tag))
+        return (g_ram[0x3e]&2) ? original : pixel==3 ? 0x27 : pixel==2 ? 0x10 : 0x0f;
     if (tag>=HEAD_ART) {
         if (!g_nes_config.blood_effects || tag>=CUT_TOP || (g_ram[0x3e]&2)) return original;
         char c=head_ink(tag,row,bit);
@@ -1025,7 +1120,7 @@ static void finish_head_sprites(Packet *p) {
     for (int i=0;i<p->count;i++) {
         Sprite *s=&p->tiles[i];
         if (s->effect==MARK_BODY && s->y<body_top) body_top=s->y;
-        if (s->effect!=MARK_HEAD) continue;
+        if (s->effect!=MARK_HEAD && s->effect!=MARK_SAW) continue;
         if (s->x<left) left=s->x;
         if (s->x>right) right=s->x;
         if (s->y<top) top=s->y;
@@ -1034,7 +1129,13 @@ static void finish_head_sprites(Packet *p) {
     int pose=(p->source.anim&127)%63;
     for (int i=0;i<p->count;i++) {
         Sprite *s=&p->tiles[i];
-        if (s->effect==MARK_HEAD) {
+        if (s->effect==MARK_SAW) {
+            int vertical=bottom-top>right-left;
+            int part=vertical ? (s->y>top) : (s->x>left);
+            int mirror=(p->source.anim&128)!=0;
+            s->effect=(!vertical && s->y<bottom) || (vertical && s->x>left) ? SAW_BLANK :
+                SAW_ART+(part^mirror)+2*vertical+(((s->attr>>4)&12)^(mirror?(vertical?8:4):0));
+        } else if (s->effect==MARK_HEAD) {
             int compact=bottom-top<5;
             int part=(2*s->x>left+right) | ((!compact && 2*s->y>top+bottom)<<1);
             s->effect=(compact?HEAD_COMPACT:HEAD_ART)+part+((s->attr>>4)&12);
@@ -1055,6 +1156,45 @@ static void finish_head_sprites(Packet *p) {
     }
 }
 
+/* The heavy throwable uses different pose numbers for walking, jumping,
+ * crouching and attacking. Select the corresponding hands-down pose for
+ * the graphics lookup while combat still uses its original move and timing. */
+static uint8_t saw_pose(uint8_t anim) {
+    int pose=anim&127;
+    if (pose==127) return anim;
+    int page=pose>=63 ? 63 : 0;
+    switch (pose-page) {
+    case 3: case 5: pose=1; break;
+    case 4: pose=0; break;
+    case 6: pose=2; break;
+    case 8: pose=0; break;
+    case 9: pose=7; break;
+    case 11: pose=10; break;
+    case 13: pose=12; break;
+    case 0x2c: pose=1; break;     /* draw back */
+    case 0x2d: pose=0x2a; break;  /* extend the arms */
+    default: return anim;
+    }
+    return (anim&128)|(page+pose);
+}
+
+enum { HAND_WEAPON_KIND=4 };
+uint8_t rcr_saw_graphics_read(uint16_t pc,uint16_t addr,uint8_t value) {
+    int obj=g_ram[0x47];
+    if (obj>=4 || !wielding_saw(obj)) return value;
+    if (pc==0xed3b) return addr==0xd3+obj ? saw_pose(value) : value;
+    if (pc==0xee4f) return addr==0x3b0+obj ? HAND_WEAPON_KIND : value;
+    const Packet *p=&s_actors.shadow[obj];
+    unsigned index=g_cpu.Y/2;
+    unsigned tile=(g_ram[0x2c]|(g_ram[0x2d]<<8))+index;
+    for (int part=0;part<2;++part) {
+        if (p->saw_grip[part].offsets && p->saw_grip[part].tile==tile &&
+            addr==p->saw_grip[part].offsets+(pc==0xef09))
+            return pc==0xeef8 ? p->saw_grip[part].x : p->saw_grip[part].y;
+    }
+    return value;
+}
+
 /* Decode ED0E..EF88's metasprite bytecode, including its linked streams,
  * per-character palettes, held objects and alternate face tiles. Signed world
  * coordinates replace only the final 8-bit screen clip. Guest RAM, OAM and
@@ -1062,8 +1202,11 @@ static void finish_head_sprites(Packet *p) {
 static void decode_packet(Packet *out) {
     const Source *src=&out->source;
     out->count=0; out->room=src->room; out->order=src->order;
+    memset(out->saw_grip,0,sizeof out->saw_grip);
     if (!src->valid) return;
-    int type=src->type, anim=src->anim;
+    int held_saw=src->item_art==SAW_HELD;
+    int type=src->type, anim=held_saw ? saw_pose(src->anim) : src->anim;
+    int saw_parts=0;
     if ((anim&0x7f)==0x7f || type>=0x40) return;
     unsigned table=word(3,0x8000+type*2), ptr=word(3,table+(anim&0x7f)*2);
     unsigned back=0, back_index=0, index=0;
@@ -1076,7 +1219,7 @@ static void decode_packet(Packet *out) {
         int count=prg(3,ptr+index++), attr=0;
         unsigned attr_ptr=0, alex_attr=0, ryan_attr=0;
         if (!count) {
-            if (src->head_item || src->headless) finish_head_sprites(out);
+            if (src->item_art || src->headless) finish_head_sprites(out);
             return;
         }
         if (count==0xff) {
@@ -1091,7 +1234,7 @@ static void decode_packet(Packet *out) {
                 back=word(3,list); back_index=0;
                 /* EE4F..EE58 subtracts five ONCE, not modulo five.
                  * In particular, held enemy kind 10 selects entry 5. */
-                unsigned kind=src->held_kind;
+                unsigned kind=held_saw ? HAND_WEAPON_KIND : src->held_kind;
                 if (kind>=5) kind-=5;
                 ptr=word(3,list+2+2*kind);
                 /* Slots 3 and 4 in the $FC branch table are the two player
@@ -1129,6 +1272,23 @@ static void decode_packet(Packet *out) {
                 tile=prg(7,0xef99+(tile-0x60)*5+src->variant);
             int dx=(int8_t)prg(3,offsets+n*2), dy=(int8_t)prg(3,offsets+n*2+1);
             Sprite *s=&out->tiles[out->count++];
+            int grip_part=-1;
+            if (held_saw && attachment && saw_parts<2) {
+                grip_part=saw_parts++;
+                int pose=(anim&127)%63;
+                /* In unflipped ROM space the fighter faces left. The motor
+                 * sits over the forward fist, then follows its extension. */
+                int reach=5;
+                if ((src->anim&127)%63==0x2c) reach=2;
+                if (pose==0x2a) reach=18;
+                dx=-reach-8*grip_part;
+                dy=pose==12 ? 7 : pose==0 ? 14 : 15;
+                if (pose==0x2a) dy=17+grip_part;
+                out->saw_grip[grip_part].tile=tiles+n;
+                out->saw_grip[grip_part].offsets=offsets+2*n;
+                out->saw_grip[grip_part].x=dx;
+                out->saw_grip[grip_part].y=dy;
+            }
             s->x=(int16_t)(src->x+(flip ? -dx-1 : dx)-4);
             s->y=(int16_t)(237-wy-dy);
             /* $FD swaps subpalettes 0 -> 1 on the shirt, and 1 -> 0 on
@@ -1149,12 +1309,16 @@ static void decode_packet(Packet *out) {
             int hair=body &&
                      (crown_pose[tile] || memcmp(hair_region[tile],empty_region,sizeof empty_region));
             s->regions=cloth | (hair ? HAIR : 0) | (body ? BODY : 0);
-            s->effect=(src->head_item==1 || (src->head_item==2 && attachment)) ? MARK_HEAD :
+            s->effect=held_saw && attachment ? SAW_BLANK :
+                      src->item_art==SAW_LOOSE ? MARK_SAW :
+                      (src->item_art==HEAD_LOOSE || (src->item_art==HEAD_HELD && attachment)) ? MARK_HEAD :
                       (src->headless && !attachment) ? MARK_BODY : 0;
             s->tile_source=tiles+n;
             s->attr_source=attr_ptr ? attr_ptr+n : 0;
             s->tile=(uint8_t)tile;
             s->attr=(uint8_t)((attr_ptr ? prg(3,attr_ptr+n) : attr)^(flip?0x40:0));
+            if (grip_part>=0)
+                s->effect=HELD_SAW_ART+grip_part+(((s->attr>>5)&6)^(flip?0:2));
         }
         if (back) { ptr=back; index=back_index; back=0; carried_owner=0; attachment=0; }
     }
@@ -1173,9 +1337,11 @@ static void capture_object(int obj, uint32_t order) {
     src->held_by=g_ram[0x3b7+obj]; src->held_kind=g_ram[0x3b0+obj];
     if (src->held_by<OBJECTS) src->held_state=g_ram[0x4f+src->held_by];
     src->headless=(headless_fighters>>obj)&1;
-    if (head_items&(1u<<obj)) src->head_item=1;
+    if (has_saw(obj)) src->item_art=SAW_LOOSE;
+    else if (obj<4 && wielding_saw(obj)) src->item_art=SAW_HELD;
+    else if (head_items&(1u<<obj)) src->item_art=HEAD_LOOSE;
     else if ((src->flags&0x40) && src->held_by<OBJECTS && (head_items&(1u<<src->held_by)))
-        src->head_item=2;
+        src->item_art=HEAD_HELD;
     src->room=g_ram[0x42]; src->valid=1;
     decode_packet(&s_actors.shadow[obj]);
 }
@@ -1257,7 +1423,7 @@ static void draw_packet(uint32_t *out, int width, const Packet *packet, int owne
 enum { BODY_LIMIT=48 };
 typedef struct {
     int16_t x,lane;
-    uint8_t room,type,variant,anim,headless;
+    uint8_t room,type,variant,anim,headless,cut; /* cut occupies legacy padding */
 } FallenEnemy;
 typedef struct {
     FallenEnemy body[BODY_LIMIT];
@@ -1291,32 +1457,68 @@ void rcr_enemy_coin(int slot) {
 }
 
 static int bodies_get(uint8_t *buf,int cap) {
-    if (cap<(int)sizeof bodies) return -1;
+    if (cap<(int)sizeof bodies+1) return -1;
     memcpy(buf,&bodies,sizeof bodies);
-    return sizeof bodies;
+    buf[sizeof bodies]=1;
+    return sizeof bodies+1;
 }
 
 static int bodies_set(const uint8_t *buf,int len) {
-    if (len!=sizeof bodies) return 0;
+    int legacy=len==sizeof bodies;
+    if (!legacy && (len!=sizeof bodies+1 || buf[sizeof bodies]!=1)) return 0;
     BodyState saved;
     memcpy(&saved,buf,sizeof saved);
     if (saved.count>BODY_LIMIT || saved.next>=BODY_LIMIT ||
         (saved.count<BODY_LIMIT && saved.next!=saved.count)) return 0;
     for (int i=0;i<saved.count;++i) {
         FallenEnemy *b=&saved.body[i];
-        if (b->type>=8 || b->room>=ROOMS || (b->anim&127)!=0x14) return 0;
+        if (legacy) b->cut=0;
+        if (b->cut>1 || b->type>=8 || b->room>=ROOMS || (b->anim&127)!=0x14) return 0;
     }
     bodies=saved;
     for (int i=0;i<bodies.count;++i) decode_body(i);
     return 1;
 }
-_Static_assert(sizeof(BodyState)<=NES_MOD_SAVESTATE_BLOB_CAP,"body save record size");
+_Static_assert(sizeof(BodyState)+1<=NES_MOD_SAVESTATE_BLOB_CAP,"body save record size");
+
+static void cut_bodies(void) {
+    if (!g_nes_config.blood_effects || !g_nes_config.persistent_bodies ||
+        !gameplay() || pause_panel() || (g_ram[0x3e]&2)) return;
+    for (int fighter=0;fighter<4;++fighter) {
+        int move=g_ram[0x4f+fighter]&127;
+        if (!(g_ram[0x48+fighter]&128) || !wielding_saw(fighter) ||
+            (move!=0x20 && move!=0x21 && move!=0x22 && move!=0x23 && move!=0x29 && move!=0x2a) ||
+            g_ram[0xb9+fighter]>16 || g_ram[0xc2+fighter]) continue;
+        int direction=(g_ram[0x6f+fighter]&128) ? -1 : 1;
+        int lane=g_ram[0x9e + fighter]|(g_ram[0xa7+fighter]<<8);
+        for (int i=0;i<bodies.count;++i) {
+            FallenEnemy *b=&bodies.body[i];
+            int ahead=(b->x-world_x(fighter))*direction;
+            if (b->cut || b->room!=g_ram[0x42] || ahead < -10 || ahead>32 || abs(b->lane-lane)>10) continue;
+            b->cut=1;
+            blood_enter_room(b->room);
+            spray(b->x,240-b->lane,-12,direction,SAW_SPRAY,1,1);
+        }
+    }
+}
 
 static void draw_bodies(uint32_t *out,int width,int view,int native) {
     if (!g_nes_config.persistent_bodies || !gameplay() || pause_panel() || (g_ram[0x3e]&2)) return;
     for (int i=0;i<bodies.count;++i) {
         int index=(bodies.next+BODY_LIMIT-bodies.count+i)%BODY_LIMIT;
-        draw_packet(out,width,&body_packets[index],3,view,native);
+        const Packet *p=&body_packets[index];
+        if (bodies.body[index].cut && g_nes_config.blood_effects && p->room==g_ram[0x42]) {
+            Packet pieces=*p;
+            /* The prone pose has four tile columns. Separate the two
+             * ends from the torso while preserving each part's artwork. */
+            for (int j=0;j<pieces.count;++j) {
+                Sprite *tile=&pieces.tiles[j];
+                int dx=tile->x-p->source.x;
+                if (dx < -8) { tile->x-=8; tile->y+=3; }
+                else if (dx>=8) { tile->x+=10; tile->y-=3; }
+            }
+            draw_packet(out,width,&pieces,3,view,native);
+        } else draw_packet(out,width,p,3,view,native);
     }
 }
 static void draw_street_items(uint32_t *out,int width,int view,int native) {
@@ -1327,7 +1529,7 @@ static void draw_street_items(uint32_t *out,int width,int view,int native) {
         Packet packet;
         packet.source=(Source){.valid=1,.type=item->type,.anim=item->anim,
             .room=street_room,.variant=item->variant,.x=item->x,.wy=item->lane+item->height,
-            .head_item=item->head};
+            .item_art=item->kind==ITEM_SAW ? SAW_LOOSE : item->kind};
         decode_packet(&packet);
         draw_packet(out,width,&packet,5,view,native);
     }
@@ -1441,6 +1643,7 @@ static void apply(void) {
     ppu_renderer_set_custom_render(s_enabled?render:NULL,NULL);
 }
 int rcr_ws_arg(const char *key, const char *value) {
+    if (!strcmp(key,"--spawn-chainsaw")) { debug_saw_pending=1; return 1; }
     if (strcmp(key,"--widescreen") || !value) return 0;
     NesAspectMode mode;
     if (!nes_video_aspect_from_name(value,&mode)) return 0;
@@ -1449,7 +1652,12 @@ int rcr_ws_arg(const char *key, const char *value) {
     apply(); return 1;
 }
 void rcr_ws_frame(void) {
-    if (!g_ram[0x40]) bodies.count=bodies.next=0;
+    if (!g_ram[0x40]) { bodies.count=bodies.next=0; opening_saw=0; }
+    if (debug_saw_pending && spawn_saw(0)) {
+        debug_saw_pending=0;
+        if (!g_ram[0x42]) opening_saw=1;
+    } else if (!opening_saw && !g_ram[0x42] && spawn_saw(32)) opening_saw=1;
+    cut_bodies();
     street_step();
     blood_step();
     if (s_ready && s_room!=g_ram[0x42] && g_ram[0x42]<ROOMS) {
@@ -1463,7 +1671,7 @@ typedef struct {
     Source shadow[OBJECTS],present[OBJECTS];
     uint32_t sequence,room,list_pending;
     int16_t shadow_camera,present_camera;
-    uint8_t head_items,headless,padding[2];
+    uint8_t head_items,headless,saws,opening_saw;
     StreetWeapon street[STREET_SLOTS];
     int32_t street_room;
 } ActorSave;
@@ -1472,6 +1680,7 @@ static int state_get(uint8_t *buf, int cap) {
     if (cap<(int)sizeof(ActorSave)) return -1;
     ActorSave state={0};
     memcpy(state.street,street_items,sizeof street_items); state.street_room=street_room;
+    state.saws=saw_items; state.opening_saw=opening_saw;
     state.head_items=head_items; state.headless=headless_fighters;
     state.shadow_camera=s_actors.shadow_camera; state.present_camera=s_actors.present_camera;
     state.sequence=s_actors.sequence; state.room=s_actors.room;
@@ -1495,16 +1704,17 @@ static int state_set(const uint8_t *buf, int len) {
         if (state.street_room < -1 || state.street_room >= 256) return 0;
         for (int i=0;i<STREET_SLOTS;++i) {
             StreetWeapon w=state.street[i];
-            if (w.type && (w.type<8 || w.type>15 || w.head>1)) return 0;
+            if (w.type && (w.type<8 || w.type>15 || w.kind>ITEM_SAW)) return 0;
         }
     }
     bodies.count=bodies.next=0; /* Older saves have no subsequent body record. */
     memcpy(street_items,state.street,sizeof street_items);
     street_room=len==sizeof state ? state.street_room : -1;
+    saw_items=state.saws&0x70; opening_saw=state.opening_saw!=0;
     head_items=state.head_items&0x70;
     headless_fighters=state.headless&0x0c;
     if (len<(int)offsetof(ActorSave,street)) for (int i=0;i<OBJECTS;++i) {
-        state.shadow[i].head_item=state.present[i].head_item=0;
+        state.shadow[i].item_art=state.present[i].item_art=0;
         state.shadow[i].headless=state.present[i].headless=0;
     }
     rcr_clear_blood_spray();
@@ -1601,6 +1811,11 @@ int rcr_ws_debug(const char *cmd, int id, const char *json) {
     if (!strncmp(cmd,"rcr_aspect_",11)) {
         if (!rcr_ws_arg("--widescreen",cmd+11)) return 0;
         debug_server_send_fmt("{\"id\":%d,\"ok\":true}",id); return 1;
+    }
+    if (!strcmp(cmd,"rcr_spawn_chainsaw")) {
+        if (spawn_saw(0)) debug_server_send_fmt("{\"id\":%d,\"ok\":true}",id);
+        else debug_server_send_fmt("{\"id\":%d,\"ok\":false,\"error\":\"Requires local street gameplay and an available item slot\"}",id);
+        return 1;
     }
     if (strcmp(cmd,"rcr_widescreen")) return 0;
     debug_server_send_fmt("{\"id\":%d,\"ok\":true,\"width\":%d,\"room\":%d,\"pages\":%d,\"camera\":%d,\"view\":%d,\"wide_frames\":%llu,\"decode_errors\":%llu,\"collision_reads\":%llu,\"activation_reads\":%llu,\"spawn_reads\":%llu,\"sprites\":[%u,%u,%u,%u,%u,%u,%u],\"terrain_pixels\":%u,\"terrain_diffs\":%u,\"pause_panel\":%u}",

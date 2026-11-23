@@ -2043,7 +2043,7 @@ index f6f065f..9cd0f1b 100644
      if (!b) return;
      free(b->coeffs); b->coeffs = NULL;
 diff --git a/runner/src/runtime.c b/runner/src/runtime.c
-index ead8435..7b89127 100644
+index ead8435..69954cf 100644
 --- a/runner/src/runtime.c
 +++ b/runner/src/runtime.c
 @@ -476,6 +476,7 @@ static int      s_guest_tick_charged = 0;
@@ -2082,7 +2082,23 @@ index ead8435..7b89127 100644
          if (pc) *pc = s_frame_resume_pc;
          if (tick_charged) *tick_charged = s_frame_resume_tick_charged;
          return 1;
-@@ -1548,6 +1563,27 @@ void nes_write(uint16_t addr, uint8_t val) {
+@@ -1386,6 +1401,15 @@ static uint8_t nes_read_inner(uint16_t addr) {
+  * bus, so unmapped/write-only reads see the most recent value. */
+ uint8_t nes_read(uint16_t addr) {
+     uint8_t v = nes_read_inner(addr);
++#ifdef NESRECOMP_DESKTOP_PAUSE
++    /* RCR metasprite pose, attachment kind and the two offset reads. */
++    if ((s_guest_pc==0xed3b && addr>=0xd3 && addr<=0xd6) ||
++        (s_guest_pc==0xee4f && addr>=0x3b0 && addr<=0x3b3) ||
++        ((s_guest_pc==0xeef8 || s_guest_pc==0xef09) && addr>=0x8000)) {
++        extern uint8_t rcr_saw_graphics_read(uint16_t pc,uint16_t addr,uint8_t value);
++        v=rcr_saw_graphics_read(s_guest_pc,addr,v);
++    }
++#endif
+     s_open_bus = v;
+     return v;
+ }
+@@ -1548,6 +1572,27 @@ void nes_write(uint16_t addr, uint8_t val) {
      if (addr <= 0x1FFF) {
          uint16_t a = addr & 0x07FF;
          uint8_t old_val = g_ram[a];
@@ -2110,7 +2126,7 @@ index ead8435..7b89127 100644
          if (g_ws_oam_sidecar && (a & 0x0700) == 0x0200 && (a & 3) == 3)
              ws_sidecar_track(a, val);
          if (s_ww_state != 0) wram_write_watch(a, old_val, val);
-@@ -2493,6 +2529,8 @@ int g_nested_nmi_policy = NESTED_NMI_POKE_SPIN_FLAGS;
+@@ -2493,6 +2538,8 @@ int g_nested_nmi_policy = NESTED_NMI_POKE_SPIN_FLAGS;
  uint16_t g_code_window_base = 0xE000;
  static int32_t s_tail_pending = -1;
  static int     s_tail_caller  = -1;
@@ -2119,7 +2135,7 @@ index ead8435..7b89127 100644
  
  void runtime_prepare_guest_resume(uint16_t pc, int tick_charged) {
      extern uint16_t g_rts_target;
-@@ -2503,6 +2541,11 @@ void runtime_prepare_guest_resume(uint16_t pc, int tick_charged) {
+@@ -2503,6 +2550,11 @@ void runtime_prepare_guest_resume(uint16_t pc, int tick_charged) {
      g_nes_dispatch_depth = 0;
      s_tail_pending = -1;
      s_tail_caller = -1;
@@ -2131,7 +2147,7 @@ index ead8435..7b89127 100644
      g_rts_target = 0;
      g_rti_target = 0;
      s_in_irq = 0;
-@@ -2860,8 +2903,6 @@ static struct {
+@@ -2860,8 +2912,6 @@ static struct {
      uint8_t s;
      uint64_t interrupt_epoch;
  } s_tail_active[TAIL_ACTIVE_MAX];
