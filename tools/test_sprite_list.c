@@ -28,10 +28,176 @@ int nes_mod_register_savestate_hook(const char *id,NESModSavestateGet g,NESModSa
 }
 void debug_server_send_fmt(const char *format,...) { (void)format; }
 
+static void test_blood(void) {
+    static uint32_t frame[256*240];
+    g_nes_config.blood_effects=1;
+    /* Two co-op victims at different lane depths, one in the air. */
+    for (int player=0;player<2;++player) {
+        g_ram[0x83+player]=60+80*player;
+        g_ram[0x9e + player]=90+24*player;
+        g_ram[0xb9+player]=12*player;
+        rcr_blood_hit(player,0);
+    }
+    for (int tick=0;tick<48;++tick) blood_step();
+    assert(blood_drop_next==2*HIT_SPRAY);
+    g_ram[0x42]=1;
+    blood_step();
+    draw_blood(frame,256,0);
+    for (int i=0;i<256*240;i++) assert(!frame[i]);
+    g_ram[0x42]=0;
+    blood_step();
+    draw_blood(frame,256,30);
+    int pixels=0;
+    for (int i=0;i<256*240;i++) if (frame[i]) ++pixels;
+    assert(pixels>30);
+    /* A full journal survives a restart, a partial tail, and another hit. */
+    blood_file=tmpfile();
+    assert(blood_file);
+    strcpy(blood_path,"test");
+    for (int x=0;x<512;++x) save_stain(3,x,140);
+    fputc(131,blood_file); fputc(0,blood_file);
+    save_stain(4,900,180);
+    rewind(blood_file);
+    memset(blood_stains,0,sizeof blood_stains);
+    load_stains(blood_file);
+    for (int x=0;x<512;++x) assert(!stain_pixel(3,x,140));
+    assert(!stain_pixel(4,900,180));
+    fclose(blood_file); blood_file=NULL; blood_path[0]=0; blood_pending=0;
+    rcr_clear_blood_spray();
+    /* Count each burst at the damage callback, including a held weapon
+     * during a kick, a weapon swing by an enemy, and a thrown object. */
+    static const struct { int source,move,drops; } hits[]={
+        {0,0x1c,HIT_SPRAY}, {1,0xa0,WEAPON_SPRAY}, {2,0x21,WEAPON_SPRAY}, {3,0x2a,WEAPON_SPRAY},
+        {0,0xa3,WEAPON_SPRAY}, {4,0x16,WEAPON_SPRAY}, {2,0x16,HIT_SPRAY}, {255,0,HIT_SPRAY}
+    };
+    for (unsigned i=0;i<sizeof hits/sizeof hits[0];i++) {
+        g_ram[5]=hits[i].source;
+        if (hits[i].source<OBJECTS) {
+            g_ram[0x4f+hits[i].source]=hits[i].move;
+            g_ram[0x56+hits[i].source]=0x40;
+            g_ram[0x3b7+hits[i].source]=4;
+        }
+        rcr_blood_hit(0,0);
+        assert(blood_drop_next==hits[i].drops);
+        for (int tick=0;tick<64;tick++) blood_step();
+        for (int j=0;j<BLOOD_DROPS;++j) assert(!blood_drops[j].floor);
+        rcr_clear_blood_spray();
+    }
+    g_ram[5]=0;
+    g_ram[0x4f]=0x20;
+    g_ram[0x6a]=1;
+    rcr_blood_hit(2,1);
+    assert(!head_items && blood_drop_next==WEAPON_SPRAY); /* missed roll */
+    g_ram[0x6a]=0;
+    g_ram[0x4c]=g_ram[0x4d]=g_ram[0x4e]=0x86;
+    rcr_blood_hit(2,1);
+    assert(!head_items && street_items[0].head && headless_fighters==(1<<2));
+    for (int tick=0;tick<64;++tick) street_step();
+    assert(street_items[0].height==0 && g_ram[0x4c]==0x86);
+    rcr_object_replaced(2);
+    /* A second successful finisher still drops with all guest slots busy. */
+    assert(drop_head(2,1) && street_items[1].head);
+    rcr_object_replaced(2);
+    /* Full pool from a street fight: a loose weapon on either side of
+     * Alex, with the middle slot held. Protect Ryan's nearby pickup too. */
+    for (int slot=4;slot<7;slot++) {
+        g_ram[0xcb+slot]=15;
+        g_ram[0x4f+slot]=0x80;
+        g_ram[0x56+slot]=0;
+        g_ram[0x9e + slot]=90;
+    }
+    g_ram[0x83+4]=85; g_ram[0x83+5]=29; g_ram[0x83+6]=210;
+    g_ram[0x4f+5]=0x82; g_ram[0x56+5]=0x40;
+    assert(ground_slot(g_ram[5])==6);
+    g_ram[0x49]=0x81; g_ram[0x84]=210; g_ram[0x9f]=90;
+    assert(ground_slot(g_ram[5])==4);
+    g_ram[0x49]=0;
+    g_ram[0x4f+6]=0x84;
+    assert(ground_slot(g_ram[5])==4);
+    g_ram[0x4f+4]=0x86;
+    assert(ground_slot(g_ram[5])==-1);
+    /* Move close to the stored head: the far loose weapon trades places
+     * with it, retaining its pickup position and appearance. */
+    g_ram[0x4f+6]=0x80;
+    street_step();
+    assert((head_items&(1<<6)) && street_items[0].type==15 && street_items[0].x==210);
+    uint8_t snapshot[512];
+    int size=state_get(snapshot,sizeof snapshot);
+    enter_street(1);
+    assert(!street_items[1].type && state_set(snapshot,size));
+    assert(street_items[1].head && street_items[0].type==15);
+    uint8_t guest_snapshot[sizeof g_ram];
+    memcpy(guest_snapshot,g_ram,sizeof guest_snapshot);
+    for (int i=2;i<STREET_SLOTS;++i) {
+        rcr_object_replaced(2);
+        assert(drop_head(2,1));
+        assert(street_items[i].type);
+    }
+    rcr_object_replaced(2);
+    assert(!drop_head(2,1));
+    memcpy(g_ram,guest_snapshot,sizeof guest_snapshot);
+    assert(state_set(snapshot,size));
+    g_ram[0x83]=210;
+    street_step();
+    assert(g_ram[0xcb+6]==15 && !(head_items&(1<<6)) && street_items[0].head);
+    assert(state_set(snapshot,offsetof(ActorSave,street)) && !street_items[0].type);
+    rcr_object_replaced(6);
+    g_ram[0x4d]=0;
+    rcr_blood_hit(1,1);
+    assert(!head_items); /* co-op player */
+    rcr_clear_blood_spray();
+    g_ram[0x4f]=0x1a;
+    rcr_blood_hit(2,1);
+    assert(!head_items && blood_drop_next==HIT_SPRAY); /* unarmed */
+    g_ram[0x4f]=0x20;
+    rcr_blood_hit(2,0);
+    assert(!head_items); /* nonlethal */
+    rcr_clear_blood_spray();
+    rcr_blood_hit(2,1);
+    assert(head_items==(1<<5) && headless_fighters==(1<<2) && blood_drop_next==FINISHER_SPRAY);
+    assert(g_ram[0xcb+5]==14 && g_ram[0x4f+5]==4);
+    rcr_object_replaced(2);
+    assert(!headless_fighters && head_items==(1<<5));
+    rcr_object_replaced(5);
+    assert(!head_items);
+    g_ram[0x4c]=g_ram[0x4d]=g_ram[0x4e]=0;
+    rcr_clear_blood_spray();
+    g_nes_config.blood_effects=0;
+    rcr_blood_hit(0,0);
+    assert(blood_room==-1);
+    uint8_t lo=0x39, hi=0x56;
+    rcr_style_sprite_row(HIDDEN,0,4,&lo,&hi);
+    assert(lo==0x39 && hi==0x56); /* Turning gore off restores guest art. */
+}
+
+static void test_persistent_bodies(void) {
+    uint8_t saved[NES_MOD_SAVESTATE_BLOB_CAP];
+    g_nes_config.persistent_bodies=0;
+    rcr_enemy_coin(2);
+    assert(!bodies.count);
+    g_nes_config.persistent_bodies=1;
+    for (int i=0;i<BODY_LIMIT+1;++i) {
+        g_ram[0x42]=i%2;
+        g_ram[0x85]=i;
+        rcr_enemy_coin(2);
+    }
+    assert(bodies.count==BODY_LIMIT && bodies.next==1);
+    assert(bodies.body[0].x==BODY_LIMIT && bodies.body[1].room==1);
+    int size=bodies_get(saved,sizeof saved);
+    bodies.count=bodies.next=0;
+    assert(size>0 && bodies_set(saved,size));
+    assert(bodies.count==BODY_LIMIT && body_packets[1].source.room==1);
+    bodies.count=bodies.next=0;
+    g_nes_config.persistent_bodies=0;
+    g_ram[0x85]=0;
+}
+
 int main(void) {
     uint8_t saved[512];
     s_ready=1; s_enabled=1;
     g_ram[0x40]=1; g_ram[0x48]=0x80; g_ram[0x4b]=0x80;
+    test_persistent_bodies();
+    test_blood();
     s_actors.room=0;
     s_actors.shadow[3].count=1;
     s_actors.shadow[3].source.valid=1;

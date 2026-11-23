@@ -8,22 +8,33 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef enum { MAIN, OPTIONS, CONTROLS, CHARACTERS, CITY_MAP, CONFIRM_QUIT, CAPTURE, CONFLICT, DEFAULTS } Page;
+typedef enum { MAIN, OPTIONS, CONTROLS, CHARACTERS, CITY_MAP, STATE_SLOTS, SLOT_ACTION, OVERWRITE, CONFIRM_QUIT, CAPTURE, CONFLICT, DEFAULTS } Page;
 typedef enum { NONE, UP, DOWN, LEFT, RIGHT, ACCEPT, BACK, ZOOM } Action;
 typedef struct {
     Page page;
     int row, match, player, pad, input, conflict_player, conflict_action, confirm;
     int map_room, map_zoom_toggle;
+    int slot, slot_status[RCR_STATE_SLOTS];
     const char *notice;
 } Menu;
 static const int action_order[]={4,5,6,7,0,1,3,2};
 static const char *const action_names[]={"Punch","Kick","Select","Start","Up","Down","Left","Right"};
 static int binding_action(const Menu *m) { return action_order[m->row-1]; }
 
-static const Page main_pages[]={MAIN, OPTIONS, CONTROLS, CHARACTERS, CITY_MAP, CONFIRM_QUIT};
+static const Page main_pages[]={MAIN, OPTIONS, CONTROLS, CHARACTERS, CITY_MAP, STATE_SLOTS, CONFIRM_QUIT};
 enum { MAIN_COUNT = sizeof(main_pages)/sizeof(main_pages[0]) };
-static const char *const main_rows[MAIN_COUNT] = {"Resume", "Options", "Controls", "Characters", "Map", "Quit game"};
-static const char *const option_rows[] = {"Widescreen", "CRT filter", "Reduce sprite flicker"};
+static const char *const main_rows[MAIN_COUNT] = {"Resume", "Options", "Controls", "Characters", "Map", "Save states", "Quit game"};
+/* Netplay skips the slot browser and keeps Quit as the last visible row. */
+static int main_index(const Menu *m,int row) {
+    return m->match && row==MAIN_COUNT-2 ? row+1 : row;
+}
+
+static void refresh_slots(Menu *m) {
+    for (int i=0;i<RCR_STATE_SLOTS;i++) m->slot_status[i]=runner_slot_status(i+1);
+}
+
+static const char *const option_rows[] = {"Widescreen", "CRT filter", "Reduce sprite flicker", "Blood effects", "Persistent bodies"};
+enum { OPTION_COUNT = sizeof option_rows / sizeof option_rows[0] };
 static const char *const quit_rows[] = {"Cancel", "Quit game"};
 static const struct { NesAspectMode mode; const char *label; } aspects[] = {
     {NES_ASPECT_STOCK,"Off"}, {NES_ASPECT_FIT,"Fit to window"}, {NES_ASPECT_16_9,"16:9"},
@@ -46,9 +57,16 @@ static void change_option(int row, int direction) {
     } else if (row == 1) {
         g_nes_config.crt_filter ^= 1;
         config_save_display_setting(DISPLAY_CRT);
-    } else {
+    } else if (row == 2) {
         g_nes_config.reduce_sprite_flicker ^= 1;
         config_save_display_setting(DISPLAY_FLICKER);
+    } else if (row == 3) {
+        g_nes_config.blood_effects ^= 1;
+        rcr_clear_blood_spray();
+        config_save_display_setting(DISPLAY_BLOOD);
+    } else {
+        g_nes_config.persistent_bodies ^= 1;
+        config_save_display_setting(DISPLAY_BODIES);
     }
 }
 
@@ -337,8 +355,10 @@ static void draw_menu(SDL_Renderer *r, SDL_Texture *texture, SDL_Texture **atlas
     int width=116, height=112;
     const char *title="Controls";
     switch(menu.page) {
-    case MAIN: height=128; title=menu.match?"Match menu":"Paused"; break;
-    case OPTIONS: width=236; height=80; title="Options"; break;
+    case MAIN: height=menu.match?128:144; title=menu.match?"Match menu":"Paused"; break;
+    case STATE_SLOTS: width=188; height=212; title="Save states"; break;
+    case SLOT_ACTION: case OVERWRITE: width=192; height=92; title="Save states"; break;
+    case OPTIONS: width=236; height=112; title="Options"; break;
     case CONFIRM_QUIT: height=64; title="Quit game?"; break;
     case CITY_MAP: draw_city_map(r,texture,atlas,&menu); return;
     case CONTROLS: width=PANEL_WIDTH; height=PANEL_HEIGHT; break;
@@ -350,7 +370,28 @@ static void draw_menu(SDL_Renderer *r, SDL_Texture *texture, SDL_Texture **atlas
     lettering(pixels,12,9,title,accent);
     if(menu.page==CONTROLS) controls_panel(pixels,&menu);
     else if(menu.page==CHARACTERS) characters_panel(pixels,&menu);
-    else if(menu.page==CAPTURE || menu.page==CONFLICT || menu.page==DEFAULTS) {
+    else if(menu.page==STATE_SLOTS) {
+        for (int i=0;i<RCR_STATE_SLOTS;i++) {
+            char label[16];
+            int y=26+i*14;
+            snprintf(label,sizeof label,"Slot %02d",i+1);
+            lettering(pixels,20,y,label,paper);
+            int status=menu.slot_status[i];
+            lettering(pixels,95,y,status==SLOT_SAVED?"Saved":status==SLOT_EMPTY?"Empty":"Unavailable",paper);
+            if (i==menu.row) lettering(pixels,8,y,">",accent);
+        }
+        if (menu.notice) lettering(pixels,12,195,menu.notice,accent);
+    } else if(menu.page==SLOT_ACTION || menu.page==OVERWRITE) {
+        char label[32];
+        int confirm=menu.page==OVERWRITE;
+        snprintf(label,sizeof label,confirm?"Replace slot %02d?":"Slot %02d",menu.slot);
+        lettering(pixels,12,25,label,paper);
+        lettering(pixels,22,42,confirm?"Cancel":"Save",paper);
+        if (confirm || menu.slot_status[menu.slot-1]==SLOT_SAVED)
+            lettering(pixels,22,58,confirm?"Replace":"Load",paper);
+        lettering(pixels,9,42+16*menu.row,">",accent);
+        if (menu.notice) lettering(pixels,12,76,menu.notice,accent);
+    } else if(menu.page==CAPTURE || menu.page==CONFLICT || menu.page==DEFAULTS) {
         char line[64];
         if(menu.page==CAPTURE) {
             snprintf(line,sizeof(line),"P%d %s",menu.player+1,action_names[binding_action(&menu)]);
@@ -366,18 +407,20 @@ static void draw_menu(SDL_Renderer *r, SDL_Texture *texture, SDL_Texture **atlas
             lettering(pixels,11,menu.confirm?70:52,">",accent);
         }
     } else {
-        int rows=menu.page==MAIN?MAIN_COUNT:menu.page==OPTIONS?3:2;
+        int rows=menu.page==MAIN?MAIN_COUNT-menu.match:menu.page==OPTIONS?OPTION_COUNT:2;
         const char *const *labels=menu.page==MAIN?main_rows:menu.page==OPTIONS?option_rows:quit_rows;
         for(int i=0;i<rows;++i) {
             int y=28+16*i;
             if(i==menu.row) lettering(pixels,7,y,">",accent);
-            const char *label=labels[i];
-            if(menu.match && menu.page==OPTIONS && i!=1) label=i==0?"Match aspect":"Match flicker setting";
+            const char *label=labels[menu.page==MAIN?main_index(&menu,i):i];
+            if(menu.match && menu.page==OPTIONS && (i==0 || i==2)) label=i==0?"Match aspect":"Match flicker setting";
             lettering(pixels,20,y,label,paper);
             if(menu.page==OPTIONS) {
                 const char *value=aspects[aspect_index()].label;
                 if(i==1) value=g_nes_config.crt_filter?"On":"Off";
                 if(i==2) value=g_nes_config.reduce_sprite_flicker?"On":"Off";
+                if(i==3) value=g_nes_config.blood_effects?"On":"Off";
+                if(i==4) value=g_nes_config.persistent_bodies?"On":"Off";
                 lettering(pixels,width-10-(int)strlen(value)*8,y,value,paper);
             }
         }
@@ -502,13 +545,40 @@ static int navigate(Menu *m, Action action) {
         }
         return 1;
     }
+    if (m->page==SLOT_ACTION || m->page==OVERWRITE) {
+        int confirm=m->page==OVERWRITE;
+        if (action==UP || action==DOWN)
+            m->row=(confirm || m->slot_status[m->slot-1]==SLOT_SAVED) ? !m->row : 0;
+        if (action==BACK || (confirm && action==ACCEPT && !m->row)) {
+            m->page=confirm ? SLOT_ACTION : STATE_SLOTS;
+            m->row=confirm ? 0 : m->slot-1;
+        } else if (action==ACCEPT) {
+            if (!confirm && m->row==1) {
+                if (runner_use_slot(m->slot,0)) return 0;
+                m->notice="Could not load slot";
+            } else {
+                int status=runner_slot_status(m->slot);
+                if (status==SLOT_UNAVAILABLE) m->notice="Slot unavailable";
+                else if (status==SLOT_SAVED && !confirm) {
+                    m->page=OVERWRITE;
+                    m->row=0;
+                } else if (runner_use_slot(m->slot,1)) {
+                    m->page=STATE_SLOTS;
+                    m->row=m->slot-1;
+                    refresh_slots(m);
+                    m->notice="State saved";
+                } else m->notice="Could not save slot";
+            }
+        }
+        return 1;
+    }
     if (m->page==CITY_MAP && action!=BACK) { move_on_map(m,action); return 1; }
-    int rows=m->page==MAIN?MAIN_COUNT:m->page==CONTROLS?10:m->page==CHARACTERS?(g_nes_config.oni_mode?1:7):m->page==OPTIONS?3:2;
+    int rows=m->page==MAIN?MAIN_COUNT-m->match:m->page==STATE_SLOTS?RCR_STATE_SLOTS:m->page==CONTROLS?10:m->page==CHARACTERS?(g_nes_config.oni_mode?1:7):m->page==OPTIONS?OPTION_COUNT:2;
     if(action==UP || action==DOWN) m->row=(m->row+(action==DOWN?1:-1)+rows)%rows;
     if(action==BACK) {
         if(m->page==MAIN) return 0;
-        for (int i=0;i<MAIN_COUNT;++i)
-            if (main_pages[i]==m->page) { m->row=i; break; }
+        for (int i=0;i<MAIN_COUNT-m->match;++i)
+            if (main_pages[main_index(m,i)]==m->page) { m->row=i; break; }
         m->page=MAIN; return 1;
     }
     int direction=action==LEFT?-1:action==RIGHT?1:0;
@@ -516,18 +586,31 @@ static int navigate(Menu *m, Action action) {
     case MAIN:
         if(action==ACCEPT) {
             if(!m->row) return 0;
-            m->page=main_pages[m->row];
+            m->page=main_pages[main_index(m,m->row)];
+            if (m->page==STATE_SLOTS) refresh_slots(m);
             if (m->page==CITY_MAP) { int here=rcr_map_current_room(); m->map_room=here<0?0:here; }
             m->row=0; m->player=0; m->pad=0;
         }
         break;
+    case STATE_SLOTS:
+        if(action==ACCEPT) {
+            m->slot=m->row+1;
+            int status=runner_slot_status(m->slot);
+            m->slot_status[m->row]=status;
+            if (status==SLOT_UNAVAILABLE) m->notice="Slot unavailable";
+            else {
+                m->page=SLOT_ACTION;
+                m->row=status==SLOT_SAVED;
+            }
+        }
+        break;
     case OPTIONS:
-        if(direction && (!m->match||m->row==1)) change_option(m->row,direction);
+        if(direction && (!m->match||m->row==1||m->row>=3)) change_option(m->row,direction);
         break;
     case CONFIRM_QUIT:
         if(action==ACCEPT) {
             if(m->row) return -1;
-            m->page=MAIN; m->row=MAIN_COUNT-1;
+            m->page=MAIN; m->row=MAIN_COUNT-1-m->match;
         }
         break;
     case CONTROLS:

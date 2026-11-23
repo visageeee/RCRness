@@ -3,6 +3,7 @@
 void rcr_ws_init(const char *rom_path);
 int rcr_ws_arg(const char *key, const char *value);
 void rcr_ws_frame(void);
+void rcr_clear_blood_spray(void);
 void rcr_wallet_frame(uint32_t *frame, int width);
 void rcr_ws_dma(void);
 uint8_t rcr_ws_read(uint16_t pc, uint16_t addr, uint8_t value);

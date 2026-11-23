@@ -7,11 +7,15 @@
 #include "nes_video.h"
 #include "mapper.h"
 #include "config.h"
+#ifdef NESRECOMP_NET
+#include "nes_netplay.h"
+#endif
 #include "mod_function_hooks.h"
 #include "mod_savestate.h"
 #include "debug_server.h"
 #include <SDL.h>
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -21,12 +25,14 @@
 #define MAX_PAGES 5
 #define PRG_SIZE 0x20000
 #define CHR_SIZE 0x20000
-typedef struct { int16_t x, y; uint8_t tile, attr, carried_owner, regions; uint16_t tile_source, attr_source; } Sprite;
+typedef struct { int16_t x, y; uint8_t tile, attr, carried_owner, regions, effect; uint16_t tile_source, attr_source; } Sprite;
 typedef struct {
     int16_t x, wy;
     uint32_t order;
-    uint8_t type, anim, variant, flags, held_by, held_state, held_kind, room, valid;
+    uint8_t type, anim, variant, flags, held_by, held_state, held_kind, room, valid, head_item, headless;
 } Source;
+/* The last two flags use padding in the legacy 20-byte saved source. */
+_Static_assert(sizeof(Source)==20, "actor save source layout");
 typedef struct {
     Sprite tiles[TILES_PER_OBJECT];
     Source source;
@@ -81,6 +87,344 @@ static int pause_panel(void) {
      * and passwords, and derives correctly from guest RAM on state load. */
     return (g_ram[0x3f]&0x20) && g_ram[0x110]==0x0c;
 }
+/* Cosmetic coordinates are in eighths of a world pixel. A drop lands at the
+ * victim's street depth, independently of their height above the street. */
+enum { BLOOD_DROPS=1024, HIT_SPRAY=24, WEAPON_SPRAY=72, FINISHER_SPRAY=320,
+       STREET_WIDTH=MAX_PAGES*256, STREET_TOP=32, STREET_BOTTOM=192 };
+typedef struct { int x,y,vx,vy,floor; } BloodDrop;
+static BloodDrop blood_drops[BLOOD_DROPS];
+static uint8_t blood_stains[ROOMS][STREET_BOTTOM-STREET_TOP][STREET_WIDTH/8];
+static uint8_t room_stained[ROOMS];
+static int blood_drop_next, blood_room=-1;
+static char blood_path[1200];
+static FILE *blood_file;
+static int blood_write_failed, blood_pending;
+
+static int stain_pixel(int room,int x,int y) {
+    if ((unsigned)x>=STREET_WIDTH || y<STREET_TOP || y>=STREET_BOTTOM) return 0;
+    uint8_t *cell=&blood_stains[room][y-STREET_TOP][x/8];
+    unsigned mask=1u<<(x%8);
+    if (*cell&mask) return 0;
+    *cell|=mask;
+    room_stained[room]=1;
+    return 1;
+}
+
+/* Each new world pixel has one four-byte journal entry. Only its room byte
+ * has the high bit set, so a truncated final write cannot misalign later
+ * entries. Appending also preserves stains from other running instances. */
+static void load_stains(FILE *f) {
+    int room=-1, pixel=0, digits=0, byte;
+    while ((byte=fgetc(f))!=EOF) {
+        if (byte&128) { room=byte&127; pixel=digits=0; }
+        else if (room>=0 && room<ROOMS) {
+            pixel=(pixel<<7)|byte;
+            if (++digits==3) {
+                stain_pixel(room,pixel%STREET_WIDTH,STREET_TOP+pixel/STREET_WIDTH);
+                room=-1;
+            }
+        }
+    }
+}
+
+static void blood_storage_init(void) {
+    char dir[1024];
+    nesrecomp_exe_dir(dir,sizeof dir);
+    snprintf(blood_path,sizeof blood_path,"%srcr-blood-v1.bin",dir);
+    FILE *f=fopen(blood_path,"rb");
+    if (f) { load_stains(f); fclose(f); }
+}
+
+static void save_stain(int room,int x,int y) {
+    if (!stain_pixel(room,x,y) || !blood_path[0] || blood_write_failed) return;
+    if (!blood_file) blood_file=fopen(blood_path,"ab");
+    int pixel=(y-STREET_TOP)*STREET_WIDTH+x;
+    uint8_t entry[]={128|room,pixel>>14,(pixel>>7)&127,pixel&127};
+    if (!blood_file || fwrite(entry,1,sizeof entry,blood_file)!=sizeof entry) {
+        perror("Saving street blood");
+        blood_write_failed=1;
+    } else blood_pending=1;
+}
+
+void rcr_clear_blood_spray(void) {
+    memset(blood_drops,0,sizeof blood_drops);
+    blood_drop_next=0;
+    blood_room=-1;
+}
+
+static void blood_enter_room(int room) {
+    if (room==blood_room) return;
+    memset(blood_drops,0,sizeof blood_drops);
+    blood_room=room;
+}
+
+static int weapon_impact(void) {
+    /* Bank 4 $8CB1 passes the striking slot ($05) to the damage calculator.
+     * Slots 4–6 deal contact damage as thrown objects. For a fighter, the
+     * $8B36 attack table selects weapon power ($04AB) for these swings. */
+    unsigned attacker=g_ram[0x05];
+    if (attacker>=OBJECTS) return 0;
+    if (attacker>=4) return 1;
+    unsigned move=g_ram[0x4f+attacker]&0x7f;
+    if (move==0x20 || move==0x21 || move==0x2a) return 1;
+    /* A throw-power attack can register contact through the wielder before
+     * release. $03B7 distinguishes a held item from a carried fighter. */
+    unsigned held=g_ram[0x3b7+attacker];
+    return (move==0x22 || move==0x23 || move==0x29) &&
+           (g_ram[0x56+attacker]&0x40) && held>=4 && held<OBJECTS;
+}
+
+/* Bit per guest slot. An ordinary weapon remains responsible for all item
+ * physics, AI, pickup, damage and throwing. Only its presentation is special. */
+static uint8_t head_items, headless_fighters;
+void rcr_object_replaced(int obj) {
+    head_items &= ~(1u<<obj);
+    headless_fighters &= ~(1u<<obj);
+}
+
+/* The guest object arrays are seven bytes apart. Store extra street items
+ * in world coordinates and give the closest pickups real guest slots. */
+typedef struct {
+    int16_t x, lane, height;
+    int8_t vx, vz;
+    uint8_t type, variant, anim, head;
+} StreetWeapon;
+enum { STREET_SLOTS=8 };
+static StreetWeapon street_items[STREET_SLOTS];
+static int street_room=-1;
+
+static void enter_street(int room) {
+    if (street_room!=room) memset(street_items,0,sizeof street_items);
+    street_room=room;
+}
+
+static int player_distance(int x,int lane) {
+    int distance=INT_MAX;
+    for (int player=0;player<2;++player) {
+        if (!(g_ram[0x48+player]&0x80)) continue;
+        int dx=abs(x-world_x(player));
+        int dy=abs(lane-(int)(g_ram[0x9e + player]|(g_ram[0xa7+player]<<8)));
+        if (dx+dy<distance) distance=dx+dy;
+    }
+    return distance;
+}
+
+static int ground_slot(int exclude) {
+    int best=-1, best_distance=-1;
+    for (int slot=4;slot<OBJECTS;++slot) {
+        if (!(g_ram[0x48+slot]&0x80)) return slot;
+        int type=g_ram[0xcb+slot];
+        if (type<8 || type>15 || (g_ram[0x4f+slot]&0x7f) ||
+            (g_ram[0x56+slot]&0xc0) || slot==exclude) continue;
+        int distance=player_distance(world_x(slot),g_ram[0x9e + slot]|(g_ram[0xa7+slot]<<8));
+        if (distance>best_distance) { best=slot; best_distance=distance; }
+    }
+    return best;
+}
+
+static StreetWeapon resting_weapon(int slot) {
+    if (!(g_ram[0x48+slot]&0x80)) return (StreetWeapon){0};
+    return (StreetWeapon){.x=world_x(slot),.lane=g_ram[0x9e + slot]|(g_ram[0xa7+slot]<<8),
+        .type=g_ram[0xcb+slot],.variant=g_ram[0x48+slot]&127,.anim=g_ram[0xd3+slot],
+        .head=(head_items>>slot)&1};
+}
+
+static int drop_head(int victim,int direction) {
+    if (victim<2 || victim>3 || g_ram[0xcb+victim]>=8 || (headless_fighters&(1u<<victim))) return 0;
+#ifdef NESRECOMP_NET
+    if (nes_netplay_active()) return 0;
+#endif
+    /* The guest update counter and impact position give a reproducible 1-in-4 roll. */
+    if ((g_ram[0x6a]+world_x(victim)+g_ram[0x9e + victim])&3) return 0;
+    enter_street(g_ram[0x42]);
+    int slot=ground_slot(g_ram[5]);
+    if (slot<0 || (g_ram[0x48+slot]&0x80)) {
+        int spare=0;
+        while (spare<STREET_SLOTS && street_items[spare].type) ++spare;
+        if (spare==STREET_SLOTS) return 0;
+        if (slot<0) {
+            street_items[spare]=(StreetWeapon){.x=world_x(victim),
+                .lane=g_ram[0x9e + victim]|(g_ram[0xa7+victim]<<8),
+                .height=20+g_ram[0xb9+victim]+(g_ram[0xc2+victim]<<8),
+                .vx=direction*2,.vz=4,.type=14,.variant=6,.head=1};
+            headless_fighters |= 1u<<victim;
+            return 1;
+        }
+        street_items[spare]=resting_weapon(slot);
+    }
+    /* Standard $0E throwable, released from head height. The guest's $04
+     * flight state bounces, lands and becomes pickable. Speeds are 8.8. */
+    const unsigned clear[]={0x5d,0x64,0x7a,0x95,0xb0,0x31d,0x32d,0x335,0x33d,
+                            0x355,0x35d,0x365,0x36d,0x3b0};
+    for (unsigned i=0;i<sizeof clear/sizeof clear[0];++i) g_ram[clear[i]+slot]=0;
+    const unsigned position[]={0x83,0x8c,0x9e,0xa7};
+    for (unsigned i=0;i<sizeof position/sizeof position[0];++i)
+        g_ram[position[i]+slot]=g_ram[position[i]+victim];
+    int z=(g_ram[0xb9+victim] | (g_ram[0xc2+victim]<<8))+20;
+    g_ram[0xb9+slot]=(uint8_t)z; g_ram[0xc2+slot]=(uint8_t)(z>>8);
+    g_ram[0xcb+slot]=14;
+    g_ram[0x50b+slot]=g_ram[0x42];
+    g_ram[0x4f+slot]=4;
+    g_ram[0x56+slot]=0x80;
+    g_ram[0x6f+slot]=direction<0 ? 0x80 : 0;
+    g_ram[0xd3+slot]=0;
+    g_ram[0x325+slot]=(uint8_t)(direction*2);
+    g_ram[0x345+slot]=3;
+    g_ram[0x34d+slot]=0x80;
+    g_ram[0x30f+slot]=0x40;
+    int attacker=g_ram[5];
+    if (attacker>=4 && attacker<OBJECTS) attacker=g_ram[0x3b7+attacker];
+    g_ram[0x3b7+slot]=(uint8_t)(attacker<4 ? attacker : victim);
+    g_ram[0x6ed+slot]=1;
+    g_ram[0x48+slot]=0x86;
+    head_items |= 1u<<slot;
+    headless_fighters |= 1u<<victim;
+    return 1;
+}
+
+void rcr_blood_hit(int victim,int fatal) {
+    if (!g_nes_config.blood_effects || !gameplay() || pause_panel()) return;
+    blood_enter_room(g_ram[0x42]);
+    int x=world_x(victim);
+    int floor=240-(int16_t)(g_ram[0x9e + victim] | (g_ram[0xa7+victim]<<8));
+    int height=(int16_t)(g_ram[0xb9+victim] | (g_ram[0xc2+victim]<<8));
+    int direction=(g_ram[0xd3+victim]&0x80) ? -1 : 1;
+    unsigned seed=(unsigned)(x+floor+blood_drop_next);
+    int weapon=weapon_impact();
+    int severed=fatal && weapon && drop_head(victim,direction);
+    unsigned drops=severed ? FINISHER_SPRAY : weapon ? WEAPON_SPRAY : HIT_SPRAY;
+    for (unsigned i=0;i<drops;++i) {
+        seed=seed*1664525u+1013904223u;
+        int spread=(int)(seed>>28);
+        BloodDrop *d=&blood_drops[blood_drop_next];
+        blood_drop_next=(blood_drop_next+1)%BLOOD_DROPS;
+        d->x=x*8;
+        d->y=(floor-height-17+(spread&3))*8;
+        d->vx=direction*(5+spread);
+        d->vy=-5-(int)((seed>>21)&15);
+        if (weapon) {
+            d->vx+=direction*(int)((seed>>8)&15);
+            d->vy-=(int)((seed>>12)&15);
+        }
+        if (severed) {
+            d->vx=direction*(int)((seed>>9)&63)-direction*22;
+            d->vy=-12-(int)((seed>>17)&55);
+            d->x+=((int)(seed&7)-3)*8;
+        }
+        d->floor=floor+(int)((seed>>16)&15)-7;
+    }
+}
+
+static void street_step(void) {
+    if (!g_ram[0x40]) { enter_street(-1); return; }
+    enter_street(g_ram[0x42]);
+    if (!gameplay() || pause_panel() || (g_ram[0x3e]&2)) return;
+#ifdef NESRECOMP_NET
+    if (nes_netplay_active()) return;
+#endif
+    int nearest=-1, distance=INT_MAX;
+    for (int i=0;i<STREET_SLOTS;++i) {
+        StreetWeapon *item=&street_items[i];
+        if (!item->type) continue;
+        if (item->height>0) {
+            item->x+=item->vx;
+            item->height+=item->vz--;
+            if (item->height>0) continue;
+            item->height=0;
+            item->anim=6;
+        }
+        int d=player_distance(item->x,item->lane);
+        if (d<distance) { nearest=i; distance=d; }
+    }
+    if (nearest<0) return;
+    int slot=ground_slot(-1);
+    if (slot<0) return;
+    StreetWeapon old=resting_weapon(slot);
+    if (old.type && distance>=player_distance(old.x,old.lane)) return;
+    StreetWeapon item=street_items[nearest];
+    street_items[nearest]=old;
+    /* Restore a settled item. Guest state $80 handles normal pickup and
+     * initializes carry/throw velocities when somebody takes the item. */
+    const unsigned clear[]={0x56,0x5d,0x64,0x6f,0x7a,0x95,0xb0,0xb9,0xc2,0x30f,
+        0x31d,0x325,0x32d,0x335,0x33d,0x345,0x34d,0x355,0x35d,0x365,0x36d,0x3b0,0x3b7};
+    for (unsigned i=0;i<sizeof clear/sizeof clear[0];++i) g_ram[clear[i]+slot]=0;
+    g_ram[0x83+slot]=(uint8_t)item.x; g_ram[0x8c+slot]=(uint16_t)item.x>>8;
+    g_ram[0x9e + slot]=(uint8_t)item.lane; g_ram[0xa7+slot]=(uint16_t)item.lane>>8;
+    g_ram[0xcb+slot]=item.type; g_ram[0xd3+slot]=item.anim;
+    g_ram[0x50b+slot]=g_ram[0x42]; g_ram[0x6ed+slot]=1;
+    g_ram[0x48+slot]=0x80|item.variant; g_ram[0x4f+slot]=0x80;
+    rcr_object_replaced(slot);
+    if (item.head) head_items|=1u<<slot;
+}
+
+static void blood_step(void) {
+    if (!g_nes_config.blood_effects) return;
+    if (!g_ram[0x40]) {
+        if (blood_room>=0) rcr_clear_blood_spray();
+        return;
+    }
+    if (!gameplay() || pause_panel()) return;
+    int room=g_ram[0x42];
+    blood_enter_room(room);
+    for (int i=0;i<BLOOD_DROPS;++i) {
+        BloodDrop *d=&blood_drops[i];
+        if (!d->floor) continue;
+        d->x+=d->vx;
+        d->y+=d->vy;
+        d->vy+=3;
+        if (d->y < d->floor*8) continue;
+        int x=d->x/8;
+        save_stain(room,x,d->floor);
+        if (i&1) save_stain(room,x+1,d->floor);
+        if (!(i%4)) save_stain(room,x,d->floor+1);
+        d->floor=0;
+    }
+    if (blood_pending) {
+        if (fflush(blood_file)!=0) {
+            perror("Saving street blood");
+            blood_write_failed=1;
+        }
+        blood_pending=0;
+    }
+}
+
+static void draw_blood(uint32_t *out,int width,int view) {
+    if (!g_nes_config.blood_effects || !gameplay() || pause_panel() ||
+        (g_ram[0x3e]&2)) return;
+    int room=g_ram[0x42];
+    int left=view<0 ? 0 : view;
+    int right=view+width>STREET_WIDTH ? STREET_WIDTH : view+width;
+    if (room_stained[room] && left<right) {
+        for (int y=STREET_TOP;y<STREET_BOTTOM;++y) {
+            for (int byte=left/8;byte<=(right-1)/8;++byte) {
+                unsigned bits=blood_stains[room][y-STREET_TOP][byte];
+                for (int bit=0;bits;++bit,bits>>=1) {
+                    int x=byte*8+bit;
+                    if ((bits&1) && x>=left && x<right)
+                        out[y*width+x-view]=((x+y)&3) ? 0xff852638 : 0xff652433;
+                }
+            }
+        }
+    }
+    if (room!=blood_room) return;
+    for (int i=0;i<BLOOD_DROPS;++i) {
+        const BloodDrop *d=&blood_drops[i];
+        if (!d->floor) continue;
+        int x=d->x/8-view, y=d->y/8;
+        if (x>=0 && x<width && y>=32 && y<192)
+            out[y*width+x]=(i&1) ? 0xffdb3846 : 0xff952734;
+    }
+}
+
+static void draw_street_items(uint32_t *out,int width,int view,int native);
+static void draw_bodies(uint32_t *out,int width,int view,int native);
+
+void rcr_draw_native_blood(uint32_t *out,int width) {
+    draw_blood(out,width,native_camera());
+    draw_bodies(out,width,native_camera(),1);
+    draw_street_items(out,width,native_camera(),1);
+}
+
 static uint8_t prg(int bank, unsigned addr) {
     if (addr >= 0xc000 && addr <= 0xffff) return s_rom[0x1c000 + addr - 0xc000];
     if (bank >= 0 && bank < 8 && addr >= 0x8000 && addr < 0xc000)
@@ -368,7 +712,7 @@ static const uint8_t hair_region[256][8] = {
 enum { SHIRT = 1, HAIR = 4, PANTS = 16, BODY = 64 };
 static uint8_t appearance_tag(const Sprite *s, int obj) {
     int owner=s->carried_owner ? s->carried_owner : obj+1;
-    return owner<=2 ? owner*s->regions : 0;
+    return s->effect ? s->effect : owner<=2 ? owner*s->regions : 0;
 }
 /* Each crown is drawn at a different angle in the ROM. Describe its
  * exposed edge in tile space, before the metasprite's horizontal/vertical
@@ -493,7 +837,42 @@ static const uint8_t sockets[8][8]={
 
 #include "oni_sprite.h"
 
+/* $C0..$DF are outside the player outfit tag range. Four tiles make
+ * the airborne head; the resting item has just two tiles in the guest OAM. */
+enum { HEAD_ART=192, HEAD_COMPACT=208, CUT_TOP=224, CUT_BOTTOM=232, HIDDEN=240,
+       MARK_HEAD=241, MARK_BODY=242 };
+static const char head_art[16][17]={
+    "................",".....######.....","...##########...","..############..",
+    "..#######ss###..","..##sss#ssss##..","..#s##ss##ss##..","..#sw#ssw#ss##..",
+    "...sssssssss#...","...sss#sssss#...","....sssss#ss....",".....s##sss.....",
+    "......ssss......","......rrr.......",".......r........","................"
+};
+static const char ground_head[8][17]={
+    ".....#####......","...#########....","..#####ss####...","..##s#ss#ss##...",
+    "..#sw#ssw#ss#...","...ssss#ssss....","....ss###ss.....",".....rrrss......"
+};
+static char head_ink(uint8_t tag,int row,int bit) {
+    int part=tag&15;
+    int x=(part&1)*8+((part&4)?bit:7-bit);
+    int y=(part&8)?7-row:row;
+    return tag>=HEAD_COMPACT ? ground_head[y][x] : head_art[(part&2)*4+y][x];
+}
+
 void rcr_style_sprite_row(uint8_t tag,uint8_t tile,int row,uint8_t *lo,uint8_t *hi) {
+    if (tag>=HEAD_ART && !g_nes_config.blood_effects) return;
+    if (tag>=CUT_TOP) {
+        if (tag==HIDDEN || (tag<CUT_BOTTOM ? row<=(tag-CUT_TOP) : row>=7-(tag-CUT_BOTTOM))) *lo=*hi=0;
+        return;
+    }
+    if (tag>=HEAD_ART) {
+        *lo=*hi=0;
+        for (int bit=0;bit<8;bit++) {
+            char c=head_ink(tag,row,bit);
+            if (c=='#' || c=='s' || c=='r') *lo |= 1u<<bit;
+            if (c=='s' || c=='w') *hi |= 1u<<bit;
+        }
+        return;
+    }
     if (g_nes_config.oni_mode && tag>>6) {
         if (oni_has_tile(tile)) {
             *lo=*hi=0;
@@ -574,6 +953,11 @@ uint8_t rcr_shirt_color(int owner, uint8_t original) {
 }
 uint8_t rcr_sprite_color(uint8_t tag, uint8_t tile, int row, int bit, int pixel, const uint8_t palette[4]) {
     uint8_t original=palette[pixel]&63;
+    if (tag>=HEAD_ART) {
+        if (!g_nes_config.blood_effects || tag>=CUT_TOP || (g_ram[0x3e]&2)) return original;
+        char c=head_ink(tag,row,bit);
+        return c=='r' ? 0x06 : c=='s' ? 0x26 : c=='w' ? 0x30 : 0x0f;
+    }
     if (g_nes_config.oni_mode && tag>>6) {
         /* Follow the guest subpalette during fades and damage flashes. */
         if ((palette[3]&63)!=0x26) return original;
@@ -618,7 +1002,7 @@ void rcr_oam_sprite_write(uint16_t pc, int slot) {
     unsigned attr = (g_ram[0x30] | (g_ram[0x31] << 8)) + g_cpu.Y;
     for (int i = 0; i < packet->count; ++i) {
         const Sprite *s = &packet->tiles[i];
-        if (s->regions && tile==s->tile_source && (s->attr_source ? attr==s->attr_source : !g_ram[0x31])) {
+        if ((s->regions || s->effect) && tile==s->tile_source && (s->attr_source ? attr==s->attr_source : !g_ram[0x31])) {
             shadow_tags[slot] = appearance_tag(s,obj);
             break;
         }
@@ -635,6 +1019,41 @@ void rcr_appearance_dma(uint8_t page, const uint8_t *oam, int repair) {
     }
 }
 void rcr_native_sprite_tags(uint8_t tags[64]) { memcpy(tags,display_tags,64); }
+
+static void finish_head_sprites(Packet *p) {
+    int left=32767,right=-32768,top=32767,bottom=-32768,body_top=32767;
+    for (int i=0;i<p->count;i++) {
+        Sprite *s=&p->tiles[i];
+        if (s->effect==MARK_BODY && s->y<body_top) body_top=s->y;
+        if (s->effect!=MARK_HEAD) continue;
+        if (s->x<left) left=s->x;
+        if (s->x>right) right=s->x;
+        if (s->y<top) top=s->y;
+        if (s->y>bottom) bottom=s->y;
+    }
+    int pose=(p->source.anim&127)%63;
+    for (int i=0;i<p->count;i++) {
+        Sprite *s=&p->tiles[i];
+        if (s->effect==MARK_HEAD) {
+            int compact=bottom-top<5;
+            int part=(2*s->x>left+right) | ((!compact && 2*s->y>top+bottom)<<1);
+            s->effect=(compact?HEAD_COMPACT:HEAD_ART)+part+((s->attr>>4)&12);
+        } else if (s->effect==MARK_BODY) {
+            s->effect=0;
+            if ((pose>=0x14 && pose<=0x16) || pose==0x3e) {
+                /* The prone head occupies the far two columns. */
+                int dx=s->x-p->source.x;
+                if ((p->source.anim&128) ? dx<=-16 : dx>=8) s->effect=HIDDEN;
+            } else if (pose>=0x18 && pose<=0x1b) {
+                if (s->tile==0xa2 || s->tile==0xa7) s->effect=HIDDEN;
+            } else if (!(pose>=0x1c && pose<=0x1f)) {
+                int cut=body_top+12-s->y;
+                if (cut>=8) s->effect=HIDDEN;
+                else if (cut>0) s->effect=((s->attr&128)?CUT_BOTTOM:CUT_TOP)+cut-1;
+            }
+        }
+    }
+}
 
 /* Decode ED0E..EF88's metasprite bytecode, including its linked streams,
  * per-character palettes, held objects and alternate face tiles. Signed world
@@ -656,7 +1075,10 @@ static void decode_packet(Packet *out) {
         if (ptr<0x8000 || ptr>0xbfff || index>255) break;
         int count=prg(3,ptr+index++), attr=0;
         unsigned attr_ptr=0, alex_attr=0, ryan_attr=0;
-        if (!count) return;
+        if (!count) {
+            if (src->head_item || src->headless) finish_head_sprites(out);
+            return;
+        }
         if (count==0xff) {
             unsigned next=word(3,ptr+index); index+=2;
             back=ptr; back_index=index; ptr=next; index=0; continue;
@@ -727,6 +1149,8 @@ static void decode_packet(Packet *out) {
             int hair=body &&
                      (crown_pose[tile] || memcmp(hair_region[tile],empty_region,sizeof empty_region));
             s->regions=cloth | (hair ? HAIR : 0) | (body ? BODY : 0);
+            s->effect=(src->head_item==1 || (src->head_item==2 && attachment)) ? MARK_HEAD :
+                      (src->headless && !attachment) ? MARK_BODY : 0;
             s->tile_source=tiles+n;
             s->attr_source=attr_ptr ? attr_ptr+n : 0;
             s->tile=(uint8_t)tile;
@@ -748,6 +1172,10 @@ static void capture_object(int obj, uint32_t order) {
     src->variant=g_ram[0x48+obj]&0x7f; src->flags=g_ram[0x56+obj];
     src->held_by=g_ram[0x3b7+obj]; src->held_kind=g_ram[0x3b0+obj];
     if (src->held_by<OBJECTS) src->held_state=g_ram[0x4f+src->held_by];
+    src->headless=(headless_fighters>>obj)&1;
+    if (head_items&(1u<<obj)) src->head_item=1;
+    else if ((src->flags&0x40) && src->held_by<OBJECTS && (head_items&(1u<<src->held_by)))
+        src->head_item=2;
     src->room=g_ram[0x42]; src->valid=1;
     decode_packet(&s_actors.shadow[obj]);
 }
@@ -798,7 +1226,7 @@ void rcr_ws_dma(void) {
         s_actors.present[obj]=s_actors.shadow[obj];
     }
 }
-static void draw_packet(uint32_t *out, int width, const Packet *packet, int owner) {
+static void draw_packet(uint32_t *out, int width, const Packet *packet, int owner,int view,int native) {
     if (packet->room != g_ram[0x42]) return;
     for (int n=0; n<packet->count; n++) {
         const Sprite *s=&packet->tiles[n];
@@ -811,11 +1239,11 @@ static void draw_packet(uint32_t *out, int width, const Packet *packet, int owne
             uint8_t lo=g_chr_ram[offset], hi=g_chr_ram[offset+8];
             if (tag) rcr_style_sprite_row(tag,s->tile,row,&lo,&hi);
             for (int x=0; x<8; x++) {
-                int px=s->x-s_view+x;
+                int px=s->x-view+x;
                 if (px<0 || px>=width) continue;
                 int bit=(s->attr&0x40)?x:7-x;
                 int c=((lo>>bit)&1)|(((hi>>bit)&1)<<1);
-                if (!c || ((s->attr&0x20)&&s_opaque[py*width+px])) continue;
+                if (!c || ((s->attr&0x20)&&(native?ppu_renderer_background_opaque(px,py):s_opaque[py*width+px]))) continue;
                 const uint8_t *palette=g_ppu_pal+0x10+(s->attr&3)*4;
                 uint8_t color=tag ? rcr_sprite_color(tag,s->tile,row,bit,c,palette) : palette[c]&63;
                 out[py*width+px]=g_nes_palette[color];
@@ -823,14 +1251,97 @@ static void draw_packet(uint32_t *out, int width, const Packet *packet, int owne
         }
     }
 }
+/* Record the enemy immediately before the guest writes its coin type.
+ * The copy lives outside actor RAM, so the coin and subsequent spawns
+ * keep the slot. Render the settled knockdown pose at street depth. */
+enum { BODY_LIMIT=48 };
+typedef struct {
+    int16_t x,lane;
+    uint8_t room,type,variant,anim,headless;
+} FallenEnemy;
+typedef struct {
+    FallenEnemy body[BODY_LIMIT];
+    uint8_t count,next;
+} BodyState;
+static BodyState bodies;
+static Packet body_packets[BODY_LIMIT];
+
+static void decode_body(int index) {
+    const FallenEnemy *b=&bodies.body[index];
+    Packet *p=&body_packets[index];
+    p->source=(Source){.valid=1,.type=b->type,.variant=b->variant,.anim=b->anim,
+        .room=b->room,.x=b->x,.wy=b->lane,.headless=b->headless};
+    decode_packet(p);
+}
+
+void rcr_enemy_coin(int slot) {
+    if (!g_nes_config.persistent_bodies || !gameplay() || slot<2 || slot>3) return;
+    /* $AFC8 has already replaced the RAM pose with the spinning coin.
+     * The previous sprite list still carries the fighter's orientation. */
+    const Source *last=&s_actors.present[slot].source;
+    unsigned facing=(last->valid && last->room==g_ram[0x42] && last->type==g_ram[0xcb+slot])
+        ? last->anim : g_ram[0x6f+slot];
+    int index=bodies.next;
+    bodies.body[index]=(FallenEnemy){.x=world_x(slot),.lane=g_ram[0x9e + slot]|(g_ram[0xa7+slot]<<8),
+        .room=g_ram[0x42],.type=g_ram[0xcb+slot],.variant=g_ram[0x48+slot]&127,
+        .anim=0x14|(facing&128),.headless=(headless_fighters>>slot)&1};
+    decode_body(index);
+    bodies.next=(index+1)%BODY_LIMIT;
+    if (bodies.count<BODY_LIMIT) ++bodies.count;
+}
+
+static int bodies_get(uint8_t *buf,int cap) {
+    if (cap<(int)sizeof bodies) return -1;
+    memcpy(buf,&bodies,sizeof bodies);
+    return sizeof bodies;
+}
+
+static int bodies_set(const uint8_t *buf,int len) {
+    if (len!=sizeof bodies) return 0;
+    BodyState saved;
+    memcpy(&saved,buf,sizeof saved);
+    if (saved.count>BODY_LIMIT || saved.next>=BODY_LIMIT ||
+        (saved.count<BODY_LIMIT && saved.next!=saved.count)) return 0;
+    for (int i=0;i<saved.count;++i) {
+        FallenEnemy *b=&saved.body[i];
+        if (b->type>=8 || b->room>=ROOMS || (b->anim&127)!=0x14) return 0;
+    }
+    bodies=saved;
+    for (int i=0;i<bodies.count;++i) decode_body(i);
+    return 1;
+}
+_Static_assert(sizeof(BodyState)<=NES_MOD_SAVESTATE_BLOB_CAP,"body save record size");
+
+static void draw_bodies(uint32_t *out,int width,int view,int native) {
+    if (!g_nes_config.persistent_bodies || !gameplay() || pause_panel() || (g_ram[0x3e]&2)) return;
+    for (int i=0;i<bodies.count;++i) {
+        int index=(bodies.next+BODY_LIMIT-bodies.count+i)%BODY_LIMIT;
+        draw_packet(out,width,&body_packets[index],3,view,native);
+    }
+}
+static void draw_street_items(uint32_t *out,int width,int view,int native) {
+    if (street_room!=g_ram[0x42] || !gameplay() || pause_panel() || (g_ram[0x3e]&2)) return;
+    for (int i=0;i<STREET_SLOTS;++i) {
+        StreetWeapon *item=&street_items[i];
+        if (!item->type) continue;
+        Packet packet;
+        packet.source=(Source){.valid=1,.type=item->type,.anim=item->anim,
+            .room=street_room,.variant=item->variant,.x=item->x,.wy=item->lane+item->height,
+            .head_item=item->head};
+        decode_packet(&packet);
+        draw_packet(out,width,&packet,5,view,native);
+    }
+}
 static void draw_actors(uint32_t *out, int width) {
+    draw_bodies(out,width,s_view,0);
+    draw_street_items(out,width,s_view,0);
     int order[OBJECTS];
     for (int i=0; i<OBJECTS; i++) order[i]=i;
     for (int i=0; i<OBJECTS; i++) for (int j=i+1; j<OBJECTS; j++)
         if (s_actors.present[order[j]].order<s_actors.present[order[i]].order) {
             int t=order[i]; order[i]=order[j]; order[j]=t;
         }
-    for (int i=0; i<OBJECTS; i++) draw_packet(out,width,&s_actors.present[order[i]],order[i]+1);
+    for (int i=0; i<OBJECTS; i++) draw_packet(out,width,&s_actors.present[order[i]],order[i]+1,s_view,0);
 }
 static int render(uint32_t *out, int width, int height, int native_x0,
                   const uint32_t *native, void *user) {
@@ -877,6 +1388,7 @@ static int render(uint32_t *out, int width, int height, int native_x0,
             s_opaque[y*width+px]=(uint8_t)ppu_renderer_background_opaque(x,y);
         }
     }
+    draw_blood(out,width,s_view);
     draw_actors(out, width);
     for (int y=0; y<32; y++)
         memcpy(out+y*width+native_x0,native+y*256,256*sizeof(uint32_t));
@@ -937,6 +1449,9 @@ int rcr_ws_arg(const char *key, const char *value) {
     apply(); return 1;
 }
 void rcr_ws_frame(void) {
+    if (!g_ram[0x40]) bodies.count=bodies.next=0;
+    street_step();
+    blood_step();
     if (s_ready && s_room!=g_ram[0x42] && g_ram[0x42]<ROOMS) {
         decode_room();
         memset(&s_actors,0,sizeof s_actors); s_actors.room=g_ram[0x42];
@@ -948,10 +1463,16 @@ typedef struct {
     Source shadow[OBJECTS],present[OBJECTS];
     uint32_t sequence,room,list_pending;
     int16_t shadow_camera,present_camera;
+    uint8_t head_items,headless,padding[2];
+    StreetWeapon street[STREET_SLOTS];
+    int32_t street_room;
 } ActorSave;
+_Static_assert(sizeof(ActorSave)<=NES_MOD_SAVESTATE_BLOB_CAP,"actor state exceeds save record");
 static int state_get(uint8_t *buf, int cap) {
     if (cap<(int)sizeof(ActorSave)) return -1;
     ActorSave state={0};
+    memcpy(state.street,street_items,sizeof street_items); state.street_room=street_room;
+    state.head_items=head_items; state.headless=headless_fighters;
     state.shadow_camera=s_actors.shadow_camera; state.present_camera=s_actors.present_camera;
     state.sequence=s_actors.sequence; state.room=s_actors.room;
     state.list_pending=s_list_pending;
@@ -962,7 +1483,7 @@ static int state_get(uint8_t *buf, int cap) {
 }
 static int state_set(const uint8_t *buf, int len) {
     /* v0.1.6 states have the same source packets but no pending-list field. */
-    if (len!=sizeof(ActorSave) && len!=offsetof(ActorSave,shadow_camera) && len!=offsetof(ActorSave,list_pending)) return 0;
+    if (len!=sizeof(ActorSave) && len!=offsetof(ActorSave,street) && len!=offsetof(ActorSave,head_items) && len!=offsetof(ActorSave,shadow_camera) && len!=offsetof(ActorSave,list_pending)) return 0;
     ActorSave state={0}; memcpy(&state,buf,(size_t)len);
     if (state.list_pending>1) return 0;
     if (state.room>=ROOMS) return 0;
@@ -970,11 +1491,29 @@ static int state_set(const uint8_t *buf, int len) {
         if (state.shadow[i].valid>1 || state.present[i].valid>1 ||
             state.shadow[i].type>=0x40 || state.present[i].type>=0x40) return 0;
     }
+    if (len==sizeof state) {
+        if (state.street_room < -1 || state.street_room >= 256) return 0;
+        for (int i=0;i<STREET_SLOTS;++i) {
+            StreetWeapon w=state.street[i];
+            if (w.type && (w.type<8 || w.type>15 || w.head>1)) return 0;
+        }
+    }
+    bodies.count=bodies.next=0; /* Older saves have no subsequent body record. */
+    memcpy(street_items,state.street,sizeof street_items);
+    street_room=len==sizeof state ? state.street_room : -1;
+    head_items=state.head_items&0x70;
+    headless_fighters=state.headless&0x0c;
+    if (len<(int)offsetof(ActorSave,street)) for (int i=0;i<OBJECTS;++i) {
+        state.shadow[i].head_item=state.present[i].head_item=0;
+        state.shadow[i].headless=state.present[i].headless=0;
+    }
+    rcr_clear_blood_spray();
     memset(&s_actors,0,sizeof s_actors);
     s_actors.sequence=state.sequence; s_actors.room=(uint8_t)state.room;
     s_list_pending=state.list_pending;
-    s_actors.shadow_camera=len==sizeof state ? state.shadow_camera : camera();
-    s_actors.present_camera=len==sizeof state ? state.present_camera : camera();
+    int saved_camera=len>=(int)offsetof(ActorSave,head_items);
+    s_actors.shadow_camera=saved_camera ? state.shadow_camera : camera();
+    s_actors.present_camera=saved_camera ? state.present_camera : camera();
     for (int i=0;i<OBJECTS;i++) {
         s_actors.shadow[i].source=state.shadow[i]; s_actors.present[i].source=state.present[i];
         decode_packet(&s_actors.shadow[i]); decode_packet(&s_actors.present[i]);
@@ -1036,6 +1575,7 @@ void rcr_ws_init(const char *rom_path) {
     int ok=fseek(f,16,SEEK_SET)==0 && fread(s_rom,1,sizeof s_rom,f)==sizeof s_rom;
     fclose(f);
     if (!ok) { fprintf(stderr,"[Widescreen] Incomplete owner ROM\n"); return; }
+    blood_storage_init();
     load_faces();
     s_ready=1;
     nes_video_on_window_resized(1280,720);
@@ -1043,6 +1583,7 @@ void rcr_ws_init(const char *rom_path) {
     /* Native-width play also supplies actors for the frozen wide preview. */
     nes_mod_set_function_hook_enabled("rcr.widescreen.metasprite",1);
     nes_mod_register_savestate_hook("rcr.widescreen.actors",state_get,state_set);
+    nes_mod_register_savestate_hook("rcr.bodies",bodies_get,bodies_set);
     nes_mod_register_savestate_hook("rcr.shirt-owners",shirt_state_get,shirt_state_set);
     ppu_renderer_set_sprite_suppress(suppress_sprite,NULL);
     apply();
@@ -1159,6 +1700,7 @@ void game_pause_preview(uint32_t *out, int width, const uint32_t *frozen, int ol
         }
         int previous_view = s_view;
         s_view = new_view;
+        draw_blood(out,width,new_view);
         draw_actors(out, width);
         s_view = previous_view;
     }
