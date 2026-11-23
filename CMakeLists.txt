@@ -14,6 +14,7 @@ find_package(SDL2 REQUIRED CONFIG)
 
 add_executable(RCRness
     ${NESRECOMP_RUNNER_SOURCES}
+    desktop_pause.c
     extras.c
     rcr_widescreen.c
     generated/rcr_full.c
@@ -38,9 +39,7 @@ if(WIN32)
             "$<TARGET_FILE_DIR:RCRness>"
     )
 endif()
-add_custom_command(TARGET RCRness POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/keybinds.ini" "$<TARGET_FILE_DIR:RCRness>")
+# The runner seeds missing bindings. Relinking must preserve player edits.
 
 if(MSVC)
     target_compile_options(RCRness PRIVATE /W3 /WX- /wd4102)
@@ -49,6 +48,7 @@ else()
 endif()
 
 target_compile_definitions(RCRness PRIVATE
+    NESRECOMP_DESKTOP_PAUSE=1
     NESRECOMP_GAME_PLAYERS=2
     NESRECOMP_GAME_OAM_DMA_FILTER=1
     NESRECOMP_DEFAULT_REDUCE_SPRITE_FLICKER=1

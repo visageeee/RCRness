@@ -116,6 +116,7 @@ uint8_t game_ram_read_hook(uint16_t pc, uint16_t addr, uint8_t val) {
 }
 
 void game_oam_dma_filter(uint8_t page, uint8_t oam[0x100]) {
+    rcr_appearance_dma(page, oam, s_completed_oam_valid);
     if (page == 0x02 && g_nes_config.reduce_sprite_flicker)
         repair_transient_oam_entries(oam);
     if (page == 0x02) rcr_ws_dma();

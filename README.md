@@ -142,7 +142,9 @@ ignored and must never be committed or attached to a public release.
 Xbox/SDL-compatible controllers are the clean-install P1 and P2 defaults. The
 checked-in `keybinds.ini` also keeps movement on WASD and A/B on K/J as a P1
 fallback; analog-stick and d-pad movement are both enabled. With two connected
-pads, the first controls player 1 and the second controls player 2.
+pads, the first controls player 1 and the second controls player 2. P2 can also
+use the arrow keys, keypad 1/2 for Punch/Kick, keypad Enter for Start, and
+keypad 0 for Select.
 
 Xbox, DualShock 4, DualSense, and recognized Switch-family pads use SDL's
 standardized HIDAPI/gamepad mappings. Newer or unmapped devices (including
@@ -151,6 +153,26 @@ available through a generic joystick fallback with PowerA-aware face buttons,
 hat/button d-pad support, analog movement, and common +/-/Share/Options mapping.
 Hotplug is supported; connect both pads before launching for deterministic P1/P2
 assignment.
+
+Press **Escape** to pause local play, including inside the original NES
+Start menu. Use the arrow keys and Enter, or either controller's D-pad and
+confirm/back buttons. Options previews widescreen and CRT changes on the
+frozen picture. Each explicit setting change is saved to `config.ini`.
+Resume or press Escape again to continue. The NES Start button still opens
+belongings, stats, and passwords. In a netplay match the overlay leaves the game running
+and sends neutral local input. Widescreen and sprite-flicker reduction retain
+their match values because both affect synchronized state. Confirming Quit
+returns to the lobby.
+
+In **Controls**, select a player, move to an action, and use Left/Right to
+select its keyboard or controller binding. Confirm and press the new input.
+Escape cancels capture. Conflicts offer a swap. The controls screen saves
+changes to `keybinds.ini`. Press Punch and Kick together to jump, or double-tap
+Left or Right to run.
+
+In **Characters**, use Left/Right to choose Alex or Ryan, then move down and
+choose a Shirt or Hair swatch. Both standing previews use the game artwork. Each
+color is saved separately in `config.ini` and applies when loading a save.
 
 Display aspect ratio is selectable without changing the native framebuffer:
 

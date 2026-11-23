@@ -59,7 +59,14 @@ the live nametables and CHR mapping; loading a state rebuilds the cache.
 The original `$ED0E` metasprite routine is observed before its OAM budget and
 8-bit clipping checks. A bounded host decoder handles linked graphics streams,
 character palettes, face variants and held objects in signed world coordinates.
-Complete sprite packets are promoted at the same page-$02 DMA as native OAM.
+The read at `$EFD9` identifies the new draw list after the previous OAM wait.
+At its first `$ED0E` call, the renderer also decodes the actors still in the
+guest's sorted `$069D` list using their current poses and guest draw order.
+A page-$02 DMA between visits can then promote the complete group. An empty
+list or an omitted actor retires at DMA. The wide camera travels with that list
+through DMA, so a repeated pose keeps its matching camera position. The native
+background strip is placed using the playfield scroll byte latched at `$E2B1`.
+That byte can lag the live camera while the next guest update is in progress.
 The native source pass suppresses those sprites so each actor is drawn once.
 Draw order and behind-background priority follow the original packet data.
 The original guest routine still runs with its original timing and writes.

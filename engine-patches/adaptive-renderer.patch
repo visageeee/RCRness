@@ -17,6 +17,48 @@ index 11a5f77..0e44ddb 100644
      if (am == AM_ABS) return is_ram_read_hooked(cfg, abs16);
      if (am == AM_ABSX || am == AM_ABSY) {
          for (int i = 0; i < cfg->ram_read_hook_count; i++)
+diff --git a/runner/include/config.h b/runner/include/config.h
+index 2a28f50..3c1743a 100644
+--- a/runner/include/config.h
++++ b/runner/include/config.h
+@@ -24,7 +24,7 @@ typedef struct {
+     /* Audio (always on) */
+     int volume;           /* 0..100; default 100 */
+ 
+-    /* Input: P1 supports 0 none, 1 keyboard, 2 gamepad; P2 supports 0 or 2. */
++    /* Input: Each port supports 0 none, 1 keyboard, 2 gamepad plus keyboard. */
+     int player_src[2];    /* default { 2 gamepad (+ keyboard fallback), 2 gamepad } */
+     int deadzone[2];      /* 0..100 percent; default { 30, 30 } */
+ 
+@@ -43,6 +43,9 @@ typedef struct {
+      * + folder picker write these. NESRECOMP_HDPACK env overrides both. */
+     int  hdpack_enabled;   /* 0 off, 1 on; default 1 (master switch) */
+     char hdpack_dir[512];  /* pack folder; "" = default <exe>/hdpack */
++    int outfit[2]; /* host-only shirt swatch, zero is Original */
++    int hair[2]; /* independent host hair swatches */
++    char widescreen_mode[16]; /* per-game aspect preset, empty = game default */
+ } NesConfig;
+ 
+ extern NesConfig g_nes_config;
+@@ -67,3 +70,7 @@ void config_load(const char *path);
+ 
+ /* Write g_nes_config to config.ini at `path`. */
+ void config_save(const char *path);
++
++typedef enum { DISPLAY_WIDESCREEN_MODE, DISPLAY_CRT, DISPLAY_FLICKER, DISPLAY_PIXEL_ASPECT, DISPLAY_ALEX_SHIRT, DISPLAY_RYAN_SHIRT, DISPLAY_ALEX_HAIR, DISPLAY_RYAN_HAIR } DisplaySetting;
++/* Persist only the preference the player explicitly edited. */
++void config_save_display_setting(DisplaySetting setting);
+diff --git a/runner/include/controller.h b/runner/include/controller.h
+index b9b8b79..2d07bb5 100644
+--- a/runner/include/controller.h
++++ b/runner/include/controller.h
+@@ -38,3 +38,6 @@ int controller_count(void);
+ 
+ /* Close all controllers and release resources. */
+ void controller_shutdown(void);
++
++const char *controller_player_name(int player, int *connected);
++int controller_raw_input(SDL_JoystickID id, int button);
 diff --git a/runner/include/hdpack.h b/runner/include/hdpack.h
 index 8e17a08..91e9a07 100644
 --- a/runner/include/hdpack.h
@@ -33,6 +75,50 @@ index 8e17a08..91e9a07 100644
  int  hdpack_active(void);    /* 1 if a pack is loaded */
  int  hdpack_scale(void);     /* upscale factor (1 when inactive) */
  
+diff --git a/runner/include/keybinds.h b/runner/include/keybinds.h
+index 1d853bb..ff1642a 100644
+--- a/runner/include/keybinds.h
++++ b/runner/include/keybinds.h
+@@ -19,6 +19,7 @@ typedef struct {
+  * so more than one physical button can map to the same NES button. */
+ typedef struct {
+     uint32_t btn_mask[8];
++    int raw_button[8]; /* optional raw button number plus one */
+     int      deadzone;     /* left-stick deadzone, 0..32767 */
+     int      analog_dpad;  /* 1 = left analog stick also drives the d-pad */
+ } GamepadBinds;
+@@ -40,7 +41,7 @@ typedef enum {
+ } NesCameraBindAction;
+ 
+ typedef struct {
+-    PlayerBinds  p1;
++    PlayerBinds  p1, p2;
+     ZapperBinds  zapper;
+     GamepadBinds pad1;
+     GamepadBinds pad2;
+@@ -53,8 +54,7 @@ void keybinds_init(const char *exe_path);
+ /* Get current keybind configuration */
+ const KeyBinds *keybinds_get(void);
+ 
+-/* Read the NES controller byte for player 1 from SDL keyboard state.
+- * Player 2 uses its explicitly assigned gamepad (or netplay peer). */
++/* Read the NES controller byte for the selected player from SDL keyboard state. */
+ uint8_t keybinds_read_player(const uint8_t *keys, int player);
+ 
+ /* Get the gamepad bindings for player 1 or 2. */
+@@ -71,3 +71,12 @@ int keybinds_zapper_crosshair(void);
+  * defaults so older keybinds.ini files remain immediately usable. */
+ SDL_Scancode keybinds_camera_key(NesCameraBindAction action);
+ int keybinds_camera_action_for_scancode(SDL_Scancode scancode);
++
++/* NES actions are A, B, Select, Start, Up, Down, Left, Right. A pad input
++ * is an SDL controller button or KEYBIND_RAW_BASE plus a raw button index. */
++enum { KEYBIND_RAW_BASE = 32 };
++int keybinds_keyboard_reserved(SDL_Scancode code);
++void keybinds_label(int player, int action, int pad, char *out, size_t size);
++int keybinds_uses(int player, int action, int pad, int input);
++int keybinds_assign(int player, int action, int pad, int input, int swap_player, int swap_action);
++int keybinds_restore(int player);
 diff --git a/runner/include/nes_runtime.h b/runner/include/nes_runtime.h
 index 058cfed..9521aba 100644
 --- a/runner/include/nes_runtime.h
@@ -218,6 +304,277 @@ index f30d181..d1b52de 100644
      ${NESRECOMP_RUNNER_ROOT}/src/runtime.c
      ${NESRECOMP_RUNNER_ROOT}/src/recomp_stack.c
      ${NESRECOMP_RUNNER_ROOT}/src/ppu_renderer.c
+diff --git a/runner/src/config.c b/runner/src/config.c
+index 0900816..a7b25c4 100644
+--- a/runner/src/config.c
++++ b/runner/src/config.c
+@@ -66,6 +66,7 @@ NesConfig g_nes_config = {
+     /*skip_launcher*/ 0,
+     /*netplay*/ "Player", "ws://netplay.technicallycomputers.ca:8765",
+     /*hdpack_enabled*/ 1, /*hdpack_dir*/ "",  /* on by default; loads <exe>/hdpack if present */
++    {0, 0}, {0, 0}, "",
+ };
+ 
+ void config_set_defaults(NesConfig *c) {
+@@ -77,7 +78,7 @@ void config_set_defaults(NesConfig *c) {
+         { 2, 2 }, { 30, 30 },
+         0,
+         "Player", "ws://netplay.technicallycomputers.ca:8765",
+-        1, "",
++        1, "", {0, 0}, {0, 0}, "",
+     };
+     if (c) *c = d;
+ }
+@@ -102,8 +103,8 @@ static char *trim(char *s) {
+ 
+ static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+ 
+-void config_load(const char *path) {
+-    config_set_defaults(&g_nes_config);
++static void load_config(const char *path, NesConfig *c) {
++    config_set_defaults(c);
+     FILE *f = fopen(path, "r");
+     if (!f) return;
+     char line[256];
+@@ -116,43 +117,44 @@ void config_load(const char *path) {
+         char *key = trim(s);
+         char *valstr = trim(eq + 1);
+         int   val = atoi(valstr);
+-        if      (!strcmp(key, "WindowScale"))   g_nes_config.window_scale  = clampi(val, 1, 8);
++        if      (!strcmp(key, "WindowScale"))   c->window_scale  = clampi(val, 1, 8);
+         else if (!strcmp(key, "Fullscreen"))
+             /* Tri-state (launcher vocabulary): 0 off, 1 borderless, 2 exclusive. */
+-            g_nes_config.fullscreen = clampi(val, 0, 2);
+-        else if (!strcmp(key, "IntegerScale"))  g_nes_config.integer_scale = val ? 1 : 0;
+-        else if (!strcmp(key, "LinearFilter"))  g_nes_config.linear_filter = val ? 1 : 0;
+-        else if (!strcmp(key, "Renderer"))      g_nes_config.renderer      = clampi(val, 0, 1);
+-        else if (!strcmp(key, "Widescreen"))    g_nes_config.widescreen    = val ? 1 : 0;
+-        else if (!strcmp(key, "Aspect4x3"))     g_nes_config.aspect_4_3    = val ? 1 : 0;
++            c->fullscreen = clampi(val, 0, 2);
++        else if (!strcmp(key, "IntegerScale"))  c->integer_scale = val ? 1 : 0;
++        else if (!strcmp(key, "LinearFilter"))  c->linear_filter = val ? 1 : 0;
++        else if (!strcmp(key, "Renderer"))      c->renderer      = clampi(val, 0, 1);
++        else if (!strcmp(key, "Widescreen"))    c->widescreen    = val ? 1 : 0;
++        else if (!strcmp(key, "AlexHair")) c->hair[0] = val;
++        else if (!strcmp(key, "RyanHair")) c->hair[1] = val;
++        else if (!strcmp(key, "AlexShirt")) c->outfit[0] = val;
++        else if (!strcmp(key, "RyanShirt")) c->outfit[1] = val;
++        else if (!strcmp(key, "WidescreenMode")) snprintf(c->widescreen_mode, sizeof(c->widescreen_mode), "%s", valstr);
++        else if (!strcmp(key, "Aspect4x3"))     c->aspect_4_3    = val ? 1 : 0;
+         else if (!strcmp(key, "ReduceSpriteFlicker"))
+-            g_nes_config.reduce_sprite_flicker = val ? 1 : 0;
+-        else if (!strcmp(key, "CrtFilter"))     g_nes_config.crt_filter = val ? 1 : 0;
+-        else if (!strcmp(key, "Volume"))        g_nes_config.volume        = clampi(val, 0, 100);
+-        else if (!strcmp(key, "Player1Source")) g_nes_config.player_src[0] = clampi(val, 0, 2);
+-        else if (!strcmp(key, "Player2Source")) g_nes_config.player_src[1] = clampi(val, 0, 2);
+-        else if (!strcmp(key, "Player1Deadzone")) g_nes_config.deadzone[0] = clampi(val, 0, 100);
+-        else if (!strcmp(key, "Player2Deadzone")) g_nes_config.deadzone[1] = clampi(val, 0, 100);
+-        else if (!strcmp(key, "SkipLauncher"))  g_nes_config.skip_launcher = val ? 1 : 0;
++            c->reduce_sprite_flicker = val ? 1 : 0;
++        else if (!strcmp(key, "CrtFilter"))     c->crt_filter = val ? 1 : 0;
++        else if (!strcmp(key, "Volume"))        c->volume        = clampi(val, 0, 100);
++        else if (!strcmp(key, "Player1Source")) c->player_src[0] = clampi(val, 0, 2);
++        else if (!strcmp(key, "Player2Source")) c->player_src[1] = clampi(val, 0, 2);
++        else if (!strcmp(key, "Player1Deadzone")) c->deadzone[0] = clampi(val, 0, 100);
++        else if (!strcmp(key, "Player2Deadzone")) c->deadzone[1] = clampi(val, 0, 100);
++        else if (!strcmp(key, "SkipLauncher"))  c->skip_launcher = val ? 1 : 0;
+         else if (!strcmp(key, "NetplayPlayerName"))
+-            snprintf(g_nes_config.netplay_player_name, sizeof(g_nes_config.netplay_player_name), "%s", valstr);
++            snprintf(c->netplay_player_name, sizeof(c->netplay_player_name), "%s", valstr);
+         else if (!strcmp(key, "NetplayLobbyUrl"))
+-            snprintf(g_nes_config.netplay_lobby_url, sizeof(g_nes_config.netplay_lobby_url), "%s", valstr);
+-        else if (!strcmp(key, "HdPackEnabled")) g_nes_config.hdpack_enabled = val ? 1 : 0;
++            snprintf(c->netplay_lobby_url, sizeof(c->netplay_lobby_url), "%s", valstr);
++        else if (!strcmp(key, "HdPackEnabled")) c->hdpack_enabled = val ? 1 : 0;
+         else if (!strcmp(key, "HdPackDir"))
+-            snprintf(g_nes_config.hdpack_dir, sizeof(g_nes_config.hdpack_dir), "%s", valstr);
++            snprintf(c->hdpack_dir, sizeof(c->hdpack_dir), "%s", valstr);
+     }
+     fclose(f);
+-    /* Player 2 no longer has a second keyboard layout. Treat legacy keyboard
+-     * selections as disabled; P2 is assigned explicitly to a gamepad/netplay. */
+-    if (g_nes_config.player_src[1] == 1)
+-        g_nes_config.player_src[1] = 0;
++
+ }
+ 
+-void config_save(const char *path) {
++static void save_config(const char *path, const NesConfig *c) {
+     FILE *f = fopen(path, "w");
+     if (!f) { fprintf(stderr, "[Config] Cannot write %s\n", path); return; }
+-    const NesConfig *c = &g_nes_config;
+     fprintf(f, "# NESRecomp settings — edited by the launcher's Settings view.\n");
+     fprintf(f, "[Display]\n");
+     fprintf(f, "WindowScale = %d\n",   c->window_scale);
+@@ -161,11 +163,14 @@ void config_save(const char *path) {
+     fprintf(f, "LinearFilter = %d\n",  c->linear_filter);
+     fprintf(f, "Renderer = %d\n",      c->renderer);
+     fprintf(f, "Widescreen = %d\n",    c->widescreen);
++    if (c->widescreen_mode[0]) fprintf(f, "WidescreenMode = %s\n", c->widescreen_mode);
+     fprintf(f, "Aspect4x3 = %d\n",     c->aspect_4_3);
+     fprintf(f, "ReduceSpriteFlicker = %d\n", c->reduce_sprite_flicker);
+     fprintf(f, "CrtFilter = %d\n",     c->crt_filter);
+     fprintf(f, "HdPackEnabled = %d\n", c->hdpack_enabled);
+     fprintf(f, "HdPackDir = %s\n",     c->hdpack_dir);
++    fprintf(f, "[Characters]\nAlexShirt = %d\nRyanShirt = %d\n", c->outfit[0], c->outfit[1]);
++    fprintf(f, "AlexHair = %d\nRyanHair = %d\n", c->hair[0], c->hair[1]);
+     fprintf(f, "[Audio]\n");
+     fprintf(f, "Volume = %d\n",        c->volume);
+     fprintf(f, "[Input]\n");
+@@ -179,3 +184,25 @@ void config_save(const char *path) {
+     fprintf(f, "NetplayLobbyUrl = %s\n", c->netplay_lobby_url);
+     fclose(f);
+ }
++
++void config_load(const char *path) { load_config(path, &g_nes_config); }
++void config_save(const char *path) { save_config(path, &g_nes_config); }
++
++void config_save_display_setting(DisplaySetting setting) {
++    NesConfig saved;
++    const char *path = config_path();
++    load_config(path, &saved);
++    switch (setting) {
++    case DISPLAY_WIDESCREEN_MODE:
++        memcpy(saved.widescreen_mode, g_nes_config.widescreen_mode, sizeof(saved.widescreen_mode));
++        break;
++    case DISPLAY_ALEX_HAIR: saved.hair[0] = g_nes_config.hair[0]; break;
++    case DISPLAY_RYAN_HAIR: saved.hair[1] = g_nes_config.hair[1]; break;
++    case DISPLAY_ALEX_SHIRT: saved.outfit[0] = g_nes_config.outfit[0]; break;
++    case DISPLAY_RYAN_SHIRT: saved.outfit[1] = g_nes_config.outfit[1]; break;
++    case DISPLAY_CRT: saved.crt_filter = g_nes_config.crt_filter; break;
++    case DISPLAY_FLICKER: saved.reduce_sprite_flicker = g_nes_config.reduce_sprite_flicker; break;
++    case DISPLAY_PIXEL_ASPECT: saved.aspect_4_3 = g_nes_config.aspect_4_3; break;
++    }
++    save_config(path, &saved);
++}
+diff --git a/runner/src/controller.c b/runner/src/controller.c
+index 4197c53..42828f6 100644
+--- a/runner/src/controller.c
++++ b/runner/src/controller.c
+@@ -8,6 +8,7 @@
+  */
+ #include "controller.h"
+ #include "keybinds.h"
++#include "config.h"
+ #include <stdio.h>
+ 
+ #define MAX_PADS 2  /* NES has two controller ports */
+@@ -22,6 +23,18 @@ typedef struct {
+ static PadSlot s_pads[MAX_PADS];
+ static int     s_count = 0;
+ 
++static char last_name[MAX_PADS][128];
++static int player_slot(int player) {
++    if (player<1 || player>2 || g_nes_config.player_src[player-1]!=2) return -1;
++    return player==2 && g_nes_config.player_src[0]==2 ? 1 : 0;
++}
++const char *controller_player_name(int player, int *connected) {
++    int slot=player_slot(player);
++    *connected=slot>=0 && s_pads[slot].joystick;
++    if (slot<0) return "Unassigned";
++    return last_name[slot][0]?last_name[slot]:"Controller";
++}
++
+ static int slot_for_instance(SDL_JoystickID id) {
+     for (int i = 0; i < MAX_PADS; i++)
+         if (s_pads[i].joystick && s_pads[i].instance_id == id) return i;
+@@ -71,6 +84,7 @@ static void open_device(int device_index) {
+     s_pads[slot].joystick = joy;
+     s_pads[slot].instance_id = id;
+     s_pads[slot].raw_fallback = raw;
++    SDL_strlcpy(last_name[slot],gc?SDL_GameControllerName(gc):SDL_JoystickName(joy),sizeof(last_name[slot]));
+     s_count++;
+     printf("[Controller] P%d connected: %s (%s)\n", slot + 1,
+            gc ? SDL_GameControllerName(gc) : SDL_JoystickName(joy),
+@@ -130,41 +144,39 @@ void controller_handle_event(const SDL_Event *ev) {
+         close_instance(ev->jdevice.which);
+ }
+ 
+-static int raw_button(SDL_Joystick *joy, int button) {
+-    return button >= 0 && button < SDL_JoystickNumButtons(joy) &&
+-           SDL_JoystickGetButton(joy, button);
++int controller_raw_input(SDL_JoystickID id, int button) {
++    SDL_Joystick *joy=SDL_JoystickFromInstanceID(id);
++    if (!joy) return -1;
++    static const int standard[]={SDL_CONTROLLER_BUTTON_A,SDL_CONTROLLER_BUTTON_B,
++        SDL_CONTROLLER_BUTTON_X,SDL_CONTROLLER_BUTTON_Y};
++    static const int powera[]={SDL_CONTROLLER_BUTTON_X,SDL_CONTROLLER_BUTTON_A,
++        SDL_CONTROLLER_BUTTON_B,SDL_CONTROLLER_BUTTON_Y};
++    if (button<4) return SDL_JoystickGetVendor(joy)==0x20d6?powera[button]:standard[button];
++    if (button==6 || button==8) return SDL_CONTROLLER_BUTTON_BACK;
++    if (button==7 || button==9) return SDL_CONTROLLER_BUTTON_START;
++    if (!SDL_JoystickNumHats(joy) && SDL_JoystickNumButtons(joy)>=15 && button>=11 && button<=14)
++        return SDL_CONTROLLER_BUTTON_DPAD_UP+button-11;
++    return KEYBIND_RAW_BASE+button;
+ }
+ 
+ static uint8_t read_raw_joystick(SDL_Joystick *joy, const GamepadBinds *gb) {
+-    uint8_t b = 0;
+-    int buttons = SDL_JoystickNumButtons(joy);
+-
+-    /* Common DirectInput/Switch ordering: the four face buttons are 0..3.
+-     * Keep the same forgiving two-buttons-per-action policy as mapped pads. */
+-    if (SDL_JoystickGetVendor(joy) == 0x20D6) {
+-        /* PowerA's Switch HID layout (also used by its newer licensed pads):
+-         * SDL A/B/X/Y correspond to raw 1/2/0/3. */
+-        if (raw_button(joy, 1) || raw_button(joy, 2)) b |= 0x80;
+-        if (raw_button(joy, 0) || raw_button(joy, 3)) b |= 0x40;
+-    } else {
+-        if (raw_button(joy, 0) || raw_button(joy, 1)) b |= 0x80;
+-        if (raw_button(joy, 2) || raw_button(joy, 3)) b |= 0x40;
++    uint8_t b=0;
++    uint32_t buttons=0;
++    int count=SDL_JoystickNumButtons(joy);
++    for(int j=0;j<count;++j) if(SDL_JoystickGetButton(joy,j)) {
++        int input=controller_raw_input(SDL_JoystickInstanceID(joy),j);
++        if(input>=0 && input<KEYBIND_RAW_BASE) buttons |= 1u<<input;
++    }
++    if(SDL_JoystickNumHats(joy)) {
++        int hat=SDL_JoystickGetHat(joy,0);
++        if(hat&SDL_HAT_UP) buttons |= 1u<<SDL_CONTROLLER_BUTTON_DPAD_UP;
++        if(hat&SDL_HAT_DOWN) buttons |= 1u<<SDL_CONTROLLER_BUTTON_DPAD_DOWN;
++        if(hat&SDL_HAT_LEFT) buttons |= 1u<<SDL_CONTROLLER_BUTTON_DPAD_LEFT;
++        if(hat&SDL_HAT_RIGHT) buttons |= 1u<<SDL_CONTROLLER_BUTTON_DPAD_RIGHT;
+     }
+-    if (raw_button(joy, 6) || raw_button(joy, 8)) b |= 0x20; /* select/-/share */
+-    if (raw_button(joy, 7) || raw_button(joy, 9)) b |= 0x10; /* start/+/options */
+-
+-    if (SDL_JoystickNumHats(joy) > 0) {
+-        uint8_t hat = SDL_JoystickGetHat(joy, 0);
+-        if (hat & SDL_HAT_UP)    b |= 0x08;
+-        if (hat & SDL_HAT_DOWN)  b |= 0x04;
+-        if (hat & SDL_HAT_LEFT)  b |= 0x02;
+-        if (hat & SDL_HAT_RIGHT) b |= 0x01;
+-    } else if (buttons >= 15) {
+-        /* Common raw Switch/DirectInput fallback when the d-pad is buttons. */
+-        if (raw_button(joy, 11)) b |= 0x08;
+-        if (raw_button(joy, 12)) b |= 0x04;
+-        if (raw_button(joy, 13)) b |= 0x02;
+-        if (raw_button(joy, 14)) b |= 0x01;
++    for(int i=0;i<8;++i) {
++        int j=gb->raw_button[i]-1;
++        if((gb->btn_mask[i]&buttons)||(j>=0&&j<count&&SDL_JoystickGetButton(joy,j))) b|=128u>>i;
+     }
+ 
+     if (gb->analog_dpad && SDL_JoystickNumAxes(joy) >= 2) {
+@@ -179,7 +191,7 @@ static uint8_t read_raw_joystick(SDL_Joystick *joy, const GamepadBinds *gb) {
+ }
+ 
+ uint8_t controller_read_player(int player) {
+-    int slot = player - 1;
++    int slot = player_slot(player);
+     if (slot < 0 || slot >= MAX_PADS || !s_pads[slot].joystick) return 0;
+     const GamepadBinds *gb = keybinds_get_pad(player);
+     if (s_pads[slot].raw_fallback)
+@@ -216,7 +228,7 @@ uint8_t controller_read_player(int player) {
+ }
+ 
+ int controller_instance_is_player(SDL_JoystickID instance_id, int player) {
+-    int slot = player - 1;
++    int slot = player_slot(player);
+     return slot >= 0 && slot < MAX_PADS && s_pads[slot].joystick &&
+            s_pads[slot].instance_id == instance_id;
+ }
 diff --git a/runner/src/hdpack.c b/runner/src/hdpack.c
 index d77aabd..6447db6 100644
 --- a/runner/src/hdpack.c
@@ -311,11 +668,277 @@ index 0000000..b296c27
 +invocation's budget when the runtime reports a completed frame. Keep the depth
 +guard, no-frame instruction cap, and explicit max_steps bound unchanged.
 +Tests exercise a 4.1-million-instruction progressing driver and a stalled loop.
+diff --git a/runner/src/keybinds.c b/runner/src/keybinds.c
+index 65c7101..05ced53 100644
+--- a/runner/src/keybinds.c
++++ b/runner/src/keybinds.c
+@@ -10,20 +10,27 @@
+ #include <string.h>
+ #include <stdlib.h>
+ #include <ctype.h>
++#ifdef _WIN32
++#include <windows.h>
++#endif
+ 
+ /* ── Default bindings ─────────────────────────────────────────────────────── */
+ 
+-static KeyBinds s_binds = {
++static KeyBinds s_binds;
++static const KeyBinds defaults = {
+     .p1 = {
+-        .a      = SDL_SCANCODE_Z,
+-        .b      = SDL_SCANCODE_X,
++        .a      = SDL_SCANCODE_K,
++        .b      = SDL_SCANCODE_J,
+         .select = SDL_SCANCODE_BACKSLASH,
+         .start  = SDL_SCANCODE_RETURN,
+-        .up     = SDL_SCANCODE_UP,
+-        .down   = SDL_SCANCODE_DOWN,
+-        .left   = SDL_SCANCODE_LEFT,
+-        .right  = SDL_SCANCODE_RIGHT,
++        .up     = SDL_SCANCODE_W,
++        .down   = SDL_SCANCODE_S,
++        .left   = SDL_SCANCODE_A,
++        .right  = SDL_SCANCODE_D,
+     },
++    .p2 = { .a=SDL_SCANCODE_KP_1, .b=SDL_SCANCODE_KP_2, .select=SDL_SCANCODE_KP_0,
++            .start=SDL_SCANCODE_KP_ENTER, .up=SDL_SCANCODE_UP, .down=SDL_SCANCODE_DOWN,
++            .left=SDL_SCANCODE_LEFT, .right=SDL_SCANCODE_RIGHT },
+     .zapper = {
+         /* Default ON: a Zapper game (g_zapper_enabled) has no other input on a
+          * PC, so the mouse IS the light gun.  Every consumer is gated on
+@@ -146,20 +153,26 @@ static SDL_Scancode name_to_scancode(const char *name) {
+ static const char *scancode_to_name(SDL_Scancode sc) {
+     const char *name = SDL_GetScancodeName(sc);
+     if (name && name[0]) return name;
+-    return "Unknown";
++    return "None";
+ }
+ 
+ /* ── Gamepad button name <-> mask helpers ─────────────────────────────────── */
+ 
+ /* Parse a comma/space-separated list of SDL controller button names
+  * (e.g. "a, b") into a bitmask of (1u << SDL_CONTROLLER_BUTTON_*). */
+-static uint32_t names_to_mask(const char *val) {
++static uint32_t names_to_mask(const char *val, int *raw) {
+     char buf[160];
+     strncpy(buf, val, sizeof(buf) - 1);
+     buf[sizeof(buf) - 1] = '\0';
+     for (char *c = buf; *c; c++) *c = (char)tolower((unsigned char)*c);
+     uint32_t mask = 0;
++    *raw = 0;
+     for (char *tok = strtok(buf, ", \t"); tok; tok = strtok(NULL, ", \t")) {
++        int index;
++        if (sscanf(tok,"raw%d",&index)==1 && index>=0 && index<256) {
++            *raw=index+1;
++            continue;
++        }
+         SDL_GameControllerButton b = SDL_GameControllerGetButtonFromString(tok);
+         if (b != SDL_CONTROLLER_BUTTON_INVALID && b < 32)
+             mask |= (1u << b);
+@@ -218,6 +231,11 @@ static void write_pad(FILE *f, const char *section, const GamepadBinds *gb) {
+     for (const ButtonDef *bd = s_buttons; bd->name; bd++) {
+         int idx = (int)(bd - s_buttons);  /* NES button index 0..7 */
+         mask_to_names(gb->btn_mask[idx], names, sizeof(names));
++        if (gb->raw_button[idx]) {
++            if (!gb->btn_mask[idx]) names[0]=0;
++            size_t len=strlen(names);
++            snprintf(names+len,sizeof(names)-len,"%sraw%d",len?",":"",gb->raw_button[idx]-1);
++        }
+         fprintf(f, "%s = %s\n", bd->name, names);
+     }
+     fprintf(f, "deadzone = %d\n", gb->deadzone);
+@@ -234,14 +252,15 @@ static void write_camera(FILE *f) {
+     fprintf(f, "\n");
+ }
+ 
+-static void write_defaults(const char *path) {
++static int write_bindings(const char *path) {
+     FILE *f = fopen(path, "w");
+-    if (!f) return;
++    if (!f) return 0;
+     fprintf(f, "# NES Controller Keybinds\n");
+     fprintf(f, "# Edit key names to customize. Use SDL key names.\n");
+     fprintf(f, "# Common keys: Z, X, Backslash, Return, Up, Down, Left, Right\n");
+     fprintf(f, "# Tab and F1-F12 are reserved runtime hotkeys.\n\n");
+     write_player(f, "player1", &s_binds.p1);
++    write_player(f, "player2", &s_binds.p2);
+     write_camera(f);
+     fprintf(f, "[zapper]\n");
+     fprintf(f, "# Mouse as the Zapper light gun (default on for Zapper games):\n");
+@@ -257,8 +276,8 @@ static void write_defaults(const char *path) {
+     fprintf(f, "# Names are positional (a=bottom, b=right, x=left, y=top on an Xbox pad).\n\n");
+     write_pad(f, "gamepad1", &s_binds.pad1);
+     write_pad(f, "gamepad2", &s_binds.pad2);
+-    fclose(f);
+-    printf("[Keybinds] Generated %s\n", path);
++    int ok=!ferror(f);
++    return fclose(f)==0 && ok;
+ }
+ 
+ static void load_ini(const char *path) {
+@@ -284,8 +303,7 @@ static void load_ini(const char *path) {
+             current = NULL;
+             cur_pad = NULL;
+             if (strcmp(section, "player1") == 0) current = &s_binds.p1;
+-            /* Legacy [player2] keyboard sections are intentionally ignored.
+-             * P2 is now assigned explicitly to a gamepad or netplay peer. */
++            else if (strcmp(section, "player2") == 0) current = &s_binds.p2;
+             else if (strcmp(section, "zapper") == 0) in_zapper = 1;
+             else if (strcmp(section, "camera") == 0) in_camera = 1;
+             else if (strcmp(section, "gamepad1") == 0) cur_pad = &s_binds.pad1;
+@@ -342,7 +360,7 @@ static void load_ini(const char *path) {
+             } else {
+                 for (const ButtonDef *bd = s_buttons; bd->name; bd++) {
+                     if (strcmp(key, bd->name) == 0) {
+-                        cur_pad->btn_mask[(int)(bd - s_buttons)] = names_to_mask(val);
++                        cur_pad->btn_mask[(int)(bd - s_buttons)] = names_to_mask(val, &cur_pad->raw_button[(int)(bd-s_buttons)]);
+                         break;
+                     }
+                 }
+@@ -359,7 +377,7 @@ static void load_ini(const char *path) {
+                     /* Try SDL's own lookup */
+                     sc = SDL_GetScancodeFromName(val);
+                 }
+-                if (sc != SDL_SCANCODE_UNKNOWN) {
++                if (sc != SDL_SCANCODE_UNKNOWN || !SDL_strcasecmp(val,"none")) {
+                     *(SDL_Scancode *)((char *)current + bd->offset) = sc;
+                 }
+                 break;
+@@ -379,6 +397,7 @@ static void load_ini(const char *path) {
+ /* ── Public API ───────────────────────────────────────────────────────────── */
+ 
+ void keybinds_init(const char *exe_path) {
++    s_binds = defaults;
+     derive_ini_path(exe_path);
+ 
+     FILE *test = fopen(s_ini_path, "r");
+@@ -386,7 +405,7 @@ void keybinds_init(const char *exe_path) {
+         fclose(test);
+         load_ini(s_ini_path);
+     } else {
+-        write_defaults(s_ini_path);
++        write_bindings(s_ini_path);
+     }
+ }
+ 
+@@ -394,23 +413,22 @@ const KeyBinds *keybinds_get(void) {
+     return &s_binds;
+ }
+ 
+-static int is_runtime_hotkey(SDL_Scancode sc) {
+-    return sc == SDL_SCANCODE_TAB ||
++int keybinds_keyboard_reserved(SDL_Scancode sc) {
++    return sc == SDL_SCANCODE_UNKNOWN || sc == SDL_SCANCODE_ESCAPE || sc == SDL_SCANCODE_TAB ||
+            (sc >= SDL_SCANCODE_F1 && sc <= SDL_SCANCODE_F12);
+ }
+ 
+ uint8_t keybinds_read_player(const uint8_t *keys, int player) {
+-    if (player != 1) return 0;
+-    const PlayerBinds *pb = &s_binds.p1;
++    const PlayerBinds *pb = player == 2 ? &s_binds.p2 : &s_binds.p1;
+     uint8_t btn = 0;
+-    if (!is_runtime_hotkey(pb->a)      && keys[pb->a])      btn |= 0x80;
+-    if (!is_runtime_hotkey(pb->b)      && keys[pb->b])      btn |= 0x40;
+-    if (!is_runtime_hotkey(pb->select) && keys[pb->select]) btn |= 0x20;
+-    if (!is_runtime_hotkey(pb->start)  && keys[pb->start])  btn |= 0x10;
+-    if (!is_runtime_hotkey(pb->up)     && keys[pb->up])     btn |= 0x08;
+-    if (!is_runtime_hotkey(pb->down)   && keys[pb->down])   btn |= 0x04;
+-    if (!is_runtime_hotkey(pb->left)   && keys[pb->left])   btn |= 0x02;
+-    if (!is_runtime_hotkey(pb->right)  && keys[pb->right])  btn |= 0x01;
++    if (!keybinds_keyboard_reserved(pb->a)      && keys[pb->a])      btn |= 0x80;
++    if (!keybinds_keyboard_reserved(pb->b)      && keys[pb->b])      btn |= 0x40;
++    if (!keybinds_keyboard_reserved(pb->select) && keys[pb->select]) btn |= 0x20;
++    if (!keybinds_keyboard_reserved(pb->start)  && keys[pb->start])  btn |= 0x10;
++    if (!keybinds_keyboard_reserved(pb->up)     && keys[pb->up])     btn |= 0x08;
++    if (!keybinds_keyboard_reserved(pb->down)   && keys[pb->down])   btn |= 0x04;
++    if (!keybinds_keyboard_reserved(pb->left)   && keys[pb->left])   btn |= 0x02;
++    if (!keybinds_keyboard_reserved(pb->right)  && keys[pb->right])  btn |= 0x01;
+     return btn;
+ }
+ 
+@@ -439,3 +457,69 @@ int keybinds_camera_action_for_scancode(SDL_Scancode scancode) {
+     }
+     return -1;
+ }
++
++static SDL_Scancode *binding_key(int player, int action) {
++    PlayerBinds *b=player==1 ? &s_binds.p1 : &s_binds.p2;
++    return (SDL_Scancode *)((char *)b+s_buttons[action].offset);
++}
++static GamepadBinds *binding_pad(int player) { return player==1 ? &s_binds.pad1 : &s_binds.pad2; }
++
++void keybinds_label(int player, int action, int pad, char *out, size_t size) {
++    if (!pad) {
++        SDL_Scancode sc=*binding_key(player,action);
++        snprintf(out,size,"%s",keybinds_keyboard_reserved(sc)?"None":scancode_to_name(sc));
++        return;
++    }
++    GamepadBinds *b=binding_pad(player);
++    mask_to_names(b->btn_mask[action],out,size);
++    if (b->raw_button[action]) {
++        size_t len=b->btn_mask[action]?strlen(out):0;
++        snprintf(out+len,size-len,"%sraw%d",len?",":"",b->raw_button[action]-1);
++    }
++}
++int keybinds_uses(int player, int action, int pad, int input) {
++    if (!pad) return (int)*binding_key(player,action)==input;
++    GamepadBinds *b=binding_pad(player);
++    if (input>=KEYBIND_RAW_BASE) return b->raw_button[action]==input-KEYBIND_RAW_BASE+1;
++    return (b->btn_mask[action] & (1u<<input)) != 0;
++}
++static int persist_bindings(KeyBinds before) {
++    char temp[sizeof(s_ini_path)+5];
++    snprintf(temp,sizeof(temp),"%s.tmp",s_ini_path);
++    if (write_bindings(temp) &&
++#ifdef _WIN32
++        MoveFileExA(temp,s_ini_path,MOVEFILE_REPLACE_EXISTING)
++#else
++        rename(temp,s_ini_path)==0
++#endif
++    ) return 1;
++    remove(temp);
++    s_binds=before;
++    return 0;
++}
++int keybinds_assign(int player, int action, int pad, int input, int swap_player, int swap_action) {
++    KeyBinds before=s_binds;
++    if (!pad) {
++        if (keybinds_keyboard_reserved((SDL_Scancode)input)) return 0;
++        SDL_Scancode *key=binding_key(player,action);
++        if (swap_player) *binding_key(swap_player,swap_action)=*key;
++        *key=(SDL_Scancode)input;
++    } else {
++        GamepadBinds *b=binding_pad(player);
++        if (swap_player) {
++            if (input < KEYBIND_RAW_BASE) b->btn_mask[swap_action] &= ~(1u << input);
++            else b->raw_button[swap_action] = 0;
++            b->btn_mask[swap_action] |= b->btn_mask[action];
++            if (b->raw_button[action]) b->raw_button[swap_action] = b->raw_button[action];
++        }
++        b->btn_mask[action]=input<KEYBIND_RAW_BASE ? 1u<<input : 0;
++        b->raw_button[action]=input>=KEYBIND_RAW_BASE ? input-KEYBIND_RAW_BASE+1 : 0;
++    }
++    return persist_bindings(before);
++}
++int keybinds_restore(int player) {
++    KeyBinds before=s_binds;
++    if (player==1) { s_binds.p1=defaults.p1; s_binds.pad1=defaults.pad1; }
++    else { s_binds.p2=defaults.p2; s_binds.pad2=defaults.pad2; }
++    return persist_bindings(before);
++}
 diff --git a/runner/src/main_runner.c b/runner/src/main_runner.c
-index d6c9e03..ce10f34 100644
+index d6c9e03..8feacb0 100644
 --- a/runner/src/main_runner.c
 +++ b/runner/src/main_runner.c
-@@ -42,6 +42,7 @@
+@@ -1,3 +1,6 @@
++#ifdef NESRECOMP_DESKTOP_PAUSE
++#include "desktop_pause.h"
++#endif
+ /*
+  * main_runner.c — SDL2 window, VBlank-callback NMI, PNG screenshot save
+  *
+@@ -42,6 +45,7 @@
  #include "save_ram.h"
  #include "config.h"
  #include "hdpack.h"
@@ -323,7 +946,7 @@ index d6c9e03..ce10f34 100644
  #include "ppu_dot.h"
  #include "interp.h"
  #ifdef NESRECOMP_NET
-@@ -197,7 +198,8 @@ int g_widescreen_right = 0;
+@@ -197,7 +201,8 @@ int g_widescreen_right = 0;
  /* The framebuffer stays at its native width. Aspect correction is a pure
   * presentation choice so screenshots, PPU output, and determinism are unchanged. */
  static int presentation_width(void) {
@@ -333,7 +956,7 @@ index d6c9e03..ce10f34 100644
                                                                 : g_render_width;
  }
  
-@@ -207,7 +209,8 @@ static void apply_presentation_geometry(void) {
+@@ -207,7 +212,8 @@ static void apply_presentation_geometry(void) {
      int scale = s_hd_texture ? s_hd_scale : crt_active ? CRT_SCALE : 1;
      SDL_RenderSetLogicalSize(s_renderer, presentation_width() * scale, 240 * scale);
      SDL_RenderSetIntegerScale(s_renderer,
@@ -343,7 +966,7 @@ index d6c9e03..ce10f34 100644
              ? SDL_TRUE : SDL_FALSE);
  }
  
-@@ -224,10 +227,15 @@ int16_t g_ws_obj_true_rel  = 0;
+@@ -224,10 +230,15 @@ int16_t g_ws_obj_true_rel  = 0;
  uint8_t g_ws_obj_rel8      = 0;
  uint8_t g_ws_obj_ctx_valid = 0;
  
@@ -361,7 +984,7 @@ index d6c9e03..ce10f34 100644
  
  /* On-demand render for Zapper light detection.  The game reads the light sensor
   * mid-frame (during func_NMI / the main loop), so we render the CURRENT PPU state
-@@ -241,7 +249,73 @@ static uint32_t           s_present_buf[512 * 240];
+@@ -241,7 +252,73 @@ static uint32_t           s_present_buf[512 * 240];
   * main loop ~813 re-rendered s_framebuf, so live display was usually spared).
   * Rendering into s_zapper_snapbuf keeps the two paths symmetric and leaves the
   * display buffer untouched. */
@@ -436,7 +1059,18 @@ index d6c9e03..ce10f34 100644
  static void zapper_on_demand_render(void) {
      if (g_dot_ppu_on)
          ppu_dot_render_snapshot(s_zapper_snapbuf);
-@@ -587,7 +661,7 @@ void save_png(const char *path, int w, int h, const void *rgb, int stride) {
+@@ -261,8 +338,9 @@ static int turbo_active(void) {
+     return g_turbo || s_turbo_hotkey_held;
+ }
+ 
++static double next_frame;
++
+ static void pace_ntsc_frame(void) {
+-    static double next_frame = 0.0;
+     const double ntsc_hz = 60.0988;
+ 
+     if (turbo_active()) {
+@@ -587,7 +665,7 @@ void save_png(const char *path, int w, int h, const void *rgb, int stride) {
  
  /* Save an ARGB8888 buffer as PNG. Callable from game code (emulated mode screenshots). */
  void runner_save_argb_png(const char *path, const uint32_t *argb, int w, int h) {
@@ -445,7 +1079,75 @@ index d6c9e03..ce10f34 100644
      int pixels = w * h;
      for (int i = 0; i < pixels; i++) {
          uint32_t px = argb[i];
-@@ -875,6 +949,14 @@ void nes_vblank_callback(void) {
+@@ -802,6 +880,67 @@ static void benchmark_write_results(Uint64 end_counter) {
+     if (s_benchmark_output && f != stdout) fclose(f);
+ }
+ 
++static void draw_frame_texture(void) {
++    /* Present-time palette swap (opt-in, default Raw = passthrough). Raw
++     * presents the raw framebuffer untouched => byte-identical to canon. */
++    const uint32_t *present = s_framebuf;
++    if (!color_lut_is_passthrough()) {
++        color_lut_apply(s_framebuf, s_present_buf, g_render_width, 240);
++        present = s_present_buf;
++    }
++    SDL_RenderClear(s_renderer);
++    if (s_hd_texture && hdpack_active() && !ppu_renderer_custom_render_active()) {
++        /* HD pack active: upscale the native frame + per-pixel side channel
++         * into the HD buffer, present the HD texture. (A game-owned wide
++         * compositor bypasses the pack: its side channel is native-space.) */
++        hdpack_upscale(present, g_render_width, s_hd_buf);
++        SDL_UpdateTexture(s_hd_texture, NULL, s_hd_buf, g_render_width * s_hd_scale * 4);
++        SDL_RenderCopy(s_renderer, s_hd_texture, NULL, NULL);
++    } else if (g_nes_config.crt_filter && s_crt_texture && s_crt_buf) {
++        int crt_width = presentation_width();
++        SDL_Rect crt_source = { 0, 0, crt_width * CRT_SCALE, 240 * CRT_SCALE };
++        crt_filter_apply_3x(present, g_render_width, 240, crt_width,
++                            s_crt_buf, s_crt_scratch);
++        SDL_UpdateTexture(s_crt_texture, &crt_source, s_crt_buf,
++                          crt_source.w * 4);
++        SDL_RenderCopy(s_renderer, s_crt_texture, &crt_source, NULL);
++    } else {
++        SDL_UpdateTexture(s_texture, NULL, present, g_render_width * 4);
++        SDL_RenderCopy(s_renderer, s_texture, NULL, NULL);
++    }
++}
++
++#ifdef NESRECOMP_DESKTOP_PAUSE
++static int pause_requested;
++static uint8_t blocked_keys[2], blocked_pads[2];
++static void draw_paused(const uint32_t *frozen, int width) {
++    video_apply_pending();
++    apply_presentation_geometry();
++    game_pause_preview(s_framebuf, g_render_width, frozen, width);
++    draw_frame_texture();
++}
++
++static void block_held_menu_inputs(void) {
++    for (int i=0;i<2;++i) {
++        blocked_keys[i]=keybinds_read_player(SDL_GetKeyboardState(NULL),i+1);
++        blocked_pads[i]=controller_read_player(i+1);
++    }
++    s_turbo_hotkey_held = SDL_GetKeyboardState(NULL)[SDL_SCANCODE_TAB];
++}
++
++static void desktop_pause(void) {
++    if (s_audio_dev) SDL_PauseAudioDevice(s_audio_dev, 1);
++    game_pause_menu(s_window, s_renderer, s_framebuf, g_render_width, draw_paused);
++    block_held_menu_inputs();
++    next_frame = 0;
++    if (s_audio_dev) {
++        if (s_bridge_ready) rab_discard(&s_bridge);
++        else SDL_ClearQueuedAudio(s_audio_dev);
++        SDL_PauseAudioDevice(s_audio_dev, 0);
++    }
++}
++#endif
++
+ /* ---- VBlank callback (called from ppu_read_reg when $2002 bit7 fires) ---- */
+ void nes_vblank_callback(void) {
+     static uint64_t s_cb_count = 0;
+@@ -875,14 +1014,41 @@ void nes_vblank_callback(void) {
          if (ev.type == SDL_WINDOWEVENT &&
              ev.window.event == SDL_WINDOWEVENT_FOCUS_GAINED)
              s_window_focused = 1;
@@ -457,10 +1159,64 @@ index d6c9e03..ce10f34 100644
 +            SDL_GetRendererOutputSize(s_renderer, &out_w, &out_h);
 +            nes_video_on_window_resized(out_w, out_h);
 +        }
++#if defined(NESRECOMP_NET) && defined(NESRECOMP_DESKTOP_PAUSE)
++        if (nes_netplay_active() && (game_match_menu_active() ||
++                (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE))) {
++            int crt_before = g_nes_config.crt_filter;
++            int result = game_match_menu_event(s_renderer, &ev, s_window_focused);
++            if (result < 0) netplay_return_to_lobby("local player left");
++            if (result == 0) block_held_menu_inputs();
++            if (g_nes_config.crt_filter != crt_before) apply_presentation_geometry();
++            continue;
++        }
++#endif
          if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) {
  #ifdef NESRECOMP_NET
              if (nes_netplay_active())
-@@ -972,7 +1054,7 @@ void nes_vblank_callback(void) {
+                 netplay_return_to_lobby("local player left");
+ #endif
++#ifdef NESRECOMP_DESKTOP_PAUSE
++            if (!ev.key.repeat && s_window_focused) {
++                if (runtime_get_vblank_depth() <= 1) desktop_pause();
++                else pause_requested = 1;
++            }
++            continue;
++#else
+             fprintf(stderr, "[RunnerExit] Escape key at frame %llu\n",
+                     (unsigned long long)g_frame_count);
+             exit(0);
++#endif
+         }
+         if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_TAB)
+             s_turbo_hotkey_held = 1;
+@@ -893,7 +1059,7 @@ void nes_vblank_callback(void) {
+             (ev.key.keysym.mod & KMOD_CTRL)) {
+             g_nes_config.aspect_4_3 = !g_nes_config.aspect_4_3;
+             apply_presentation_geometry();
+-            config_save(config_path());
++            config_save_display_setting(DISPLAY_PIXEL_ASPECT);
+             if (s_window && !(SDL_GetWindowFlags(s_window) & SDL_WINDOW_FULLSCREEN)) {
+                 int ww, wh;
+                 SDL_GetWindowSize(s_window, &ww, &wh);
+@@ -910,7 +1076,7 @@ void nes_vblank_callback(void) {
+             (ev.key.keysym.mod & KMOD_CTRL)) {
+             g_nes_config.reduce_sprite_flicker =
+                 !g_nes_config.reduce_sprite_flicker;
+-            config_save(config_path());
++            config_save_display_setting(DISPLAY_FLICKER);
+             printf("[Display] Reduce sprite flicker: %s\n",
+                    g_nes_config.reduce_sprite_flicker ? "on" : "off");
+         }
+@@ -920,7 +1086,7 @@ void nes_vblank_callback(void) {
+             (ev.key.keysym.mod & KMOD_CTRL)) {
+             g_nes_config.crt_filter = !g_nes_config.crt_filter;
+             apply_presentation_geometry();
+-            config_save(config_path());
++            config_save_display_setting(DISPLAY_CRT);
+             printf("[Display] CRT/composite filter: %s\n",
+                    g_nes_config.crt_filter ? "on" : "off");
+         }
+@@ -972,7 +1138,7 @@ void nes_vblank_callback(void) {
  #ifdef NESRECOMP_NET
      if (!nes_netplay_active())
  #endif
@@ -469,7 +1225,76 @@ index d6c9e03..ce10f34 100644
          if (s_audio_dev) SDL_PauseAudioDevice(s_audio_dev, 1);
          if (!SDL_WaitEventTimeout(&ev, 100)) continue;
  
-@@ -1470,6 +1552,7 @@ smoke_skip_input:
+@@ -995,6 +1161,13 @@ void nes_vblank_callback(void) {
+         }
+     }
+ 
++#ifdef NESRECOMP_DESKTOP_PAUSE
++    if (pause_requested && runtime_get_vblank_depth() <= 1) {
++        pause_requested = 0;
++        desktop_pause();
++    }
++#endif
++
+     /* Zapper mouse input: poll absolute mouse position each frame. A script
+      * TRIGGER takes precedence — the mouse must not clobber a scripted aim/
+      * trigger (it would reset g_zapper_x/y/trigger every frame, defeating any
+@@ -1011,14 +1184,18 @@ void nes_vblank_callback(void) {
+         const uint8_t *keys = SDL_GetKeyboardState(NULL);
+         /* Assign connected pads densely to players configured for gamepad input.
+          * Physical pad slot 1 must not disappear merely because P1 uses keyboard. */
+-        int s1 = g_nes_config.player_src[0], s2 = g_nes_config.player_src[1];
+-        int next_pad = 1;
+-        uint8_t p1_pad = (uint8_t)(s1 == 2 ? controller_read_player(next_pad++) : 0);
+-        uint8_t p2_pad = (uint8_t)(s2 == 2 ? controller_read_player(next_pad++) : 0);
+-        uint8_t p1_keys = keybinds_read_player(keys, 1);
+-        /* Keyboard remains an emergency fallback for the primary gamepad slot. */
+-        uint8_t btn = (uint8_t)(s1 == 1 ? p1_keys : s1 == 2 ? (p1_keys | p1_pad) : 0);
+-
++        uint8_t buttons[2];
++        for (int i=0;i<2;++i) {
++            uint8_t keyboard=keybinds_read_player(keys,i+1), pad=controller_read_player(i+1);
++#ifdef NESRECOMP_DESKTOP_PAUSE
++            blocked_keys[i] &= keyboard;
++            blocked_pads[i] &= pad;
++            keyboard &= ~blocked_keys[i];
++            pad &= ~blocked_pads[i];
++#endif
++            buttons[i]=g_nes_config.player_src[i] ? keyboard|pad : 0;
++        }
++        uint8_t btn=buttons[0];
+         /* Recording: capture combined input before script override */
+         record_tick(g_frame_count, btn, turbo_active());
+ 
+@@ -1031,7 +1208,7 @@ void nes_vblank_callback(void) {
+         if (tcp_btn >= 0) btn = (uint8_t)tcp_btn;
+ 
+         g_controller1_buttons = btn;
+-        g_controller2_buttons = p2_pad;
++        g_controller2_buttons = buttons[1];
+     }
+ 
+ smoke_skip_input:
+@@ -1052,6 +1229,9 @@ smoke_skip_input:
+         uint8_t local = nes_netplay_input_player()
+                       ? g_controller2_buttons : g_controller1_buttons;
+         uint32_t tick = 0, a = 0, b = 0;
++#ifdef NESRECOMP_DESKTOP_PAUSE
++        if (game_match_menu_active()) local = 0;
++#endif
+         if (nes_netplay_needs_local_sample()) nes_netplay_stage_local(local);
+         while (!nes_netplay_poll_admit()) {
+             if (nes_netplay_state_desync(&tick, &a, &b)) {
+@@ -1072,6 +1252,8 @@ smoke_skip_input:
+         }
+         if (nes_netplay_state_desync(&tick, &a, &b))
+             netplay_return_to_lobby("deterministic state mismatch");
++    }
++    if (nes_netplay_active()) {
+         g_controller1_buttons = nes_netplay_published_buttons(0);
+         g_controller2_buttons = nes_netplay_published_buttons(1);
+     }
+@@ -1470,6 +1652,7 @@ smoke_skip_input:
              exit(0);
          }
          finish_frame_callback();
@@ -477,7 +1302,7 @@ index d6c9e03..ce10f34 100644
          return; /* skip all SDL rendering/pacing */
      }
  
-@@ -1537,7 +1620,7 @@ smoke_skip_input:
+@@ -1537,7 +1720,7 @@ smoke_skip_input:
      {
          char shot_path[256];
          if (script_wants_screenshot(shot_path, sizeof(shot_path))) {
@@ -486,7 +1311,7 @@ index d6c9e03..ce10f34 100644
                  /* Capture the HD output so screenshots match what is displayed. */
                  int hw = g_render_width * s_hd_scale, hh = 240 * s_hd_scale;
                  hdpack_upscale(s_framebuf, g_render_width, s_hd_buf);
-@@ -1554,7 +1637,7 @@ smoke_skip_input:
+@@ -1554,7 +1737,7 @@ smoke_skip_input:
                      printf("[Shot] %s (HD %dx%d)\n", shot_path, hw, hh);
                  }
              } else {
@@ -495,20 +1320,40 @@ index d6c9e03..ce10f34 100644
                  int npx = g_render_width * 240;
                  for (int i = 0; i < npx; i++) {
                      uint32_t px = s_framebuf[i];
-@@ -1621,9 +1704,10 @@ smoke_skip_input:
-             present = s_present_buf;
-         }
-         SDL_RenderClear(s_renderer);
+@@ -1613,35 +1796,17 @@ smoke_skip_input:
+      * In turbo mode, only present every 16th frame to avoid vsync blocking
+      * on every SDL_RenderPresent call (~6ms each on a 165Hz monitor). */
+     if (!turbo_active() || (g_frame_count & 15) == 0) {
+-        /* Present-time palette swap (opt-in, default Raw = passthrough). Raw
+-         * presents the raw framebuffer untouched => byte-identical to canon. */
+-        const uint32_t *present = s_framebuf;
+-        if (!color_lut_is_passthrough()) {
+-            color_lut_apply(s_framebuf, s_present_buf, g_render_width, 240);
+-            present = s_present_buf;
+-        }
+-        SDL_RenderClear(s_renderer);
 -        if (s_hd_texture && hdpack_active()) {
-+        if (s_hd_texture && hdpack_active() && !ppu_renderer_custom_render_active()) {
-             /* HD pack active: upscale the native frame + per-pixel side channel
+-            /* HD pack active: upscale the native frame + per-pixel side channel
 -             * into the HD buffer, present the HD texture. */
-+             * into the HD buffer, present the HD texture. (A game-owned wide
-+             * compositor bypasses the pack: its side channel is native-space.) */
-             hdpack_upscale(present, g_render_width, s_hd_buf);
-             SDL_UpdateTexture(s_hd_texture, NULL, s_hd_buf, g_render_width * s_hd_scale * 4);
-             SDL_RenderCopy(s_renderer, s_hd_texture, NULL, NULL);
-@@ -1642,6 +1726,10 @@ smoke_skip_input:
+-            hdpack_upscale(present, g_render_width, s_hd_buf);
+-            SDL_UpdateTexture(s_hd_texture, NULL, s_hd_buf, g_render_width * s_hd_scale * 4);
+-            SDL_RenderCopy(s_renderer, s_hd_texture, NULL, NULL);
+-        } else if (g_nes_config.crt_filter && s_crt_texture && s_crt_buf) {
+-            int crt_width = presentation_width();
+-            SDL_Rect crt_source = { 0, 0, crt_width * CRT_SCALE, 240 * CRT_SCALE };
+-            crt_filter_apply_3x(present, g_render_width, 240, crt_width,
+-                                s_crt_buf, s_crt_scratch);
+-            SDL_UpdateTexture(s_crt_texture, &crt_source, s_crt_buf,
+-                              crt_source.w * 4);
+-            SDL_RenderCopy(s_renderer, s_crt_texture, &crt_source, NULL);
+-        } else {
+-            SDL_UpdateTexture(s_texture, NULL, present, g_render_width * 4);
+-            SDL_RenderCopy(s_renderer, s_texture, NULL, NULL);
+-        }
++        draw_frame_texture();
++#if defined(NESRECOMP_NET) && defined(NESRECOMP_DESKTOP_PAUSE)
++        game_match_menu_draw(s_renderer);
++#endif
          SDL_RenderPresent(s_renderer);
      }
  
@@ -519,15 +1364,33 @@ index d6c9e03..ce10f34 100644
      pace_ntsc_frame();
      finish_frame_callback();
  }
-@@ -1753,6 +1841,7 @@ uint8_t *runner_get_prg_bank_rw(int bank_num) {
+@@ -1753,7 +1918,12 @@ uint8_t *runner_get_prg_bank_rw(int bank_num) {
   * ROM discovery and CRC verification. argv[1] is guaranteed to be the ROM path.
   */
  int nesrecomp_runner_run(int argc, char *argv[]) {
 +    video_alloc_buffers();
  
++#ifdef NESRECOMP_DESKTOP_PAUSE
++    if (g_nes_config.widescreen_mode[0])
++        game_handle_arg("--widescreen", g_nes_config.widescreen_mode);
++#endif
      /* Parse optional flags */
      for (int i = 2; i < argc; i++) {
-@@ -1847,7 +1936,7 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
+         if      (strcmp(argv[i], "--script")    == 0 && i+1 < argc) s_script_path    = argv[++i];
+@@ -1796,7 +1966,12 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
+ 
+     runtime_session_reset();
+     runtime_init();
++#if defined(__linux__)
++    const char *appimage = getenv("APPIMAGE");
++    keybinds_init(appimage && *appimage ? appimage : argv[0]);
++#else
+     keybinds_init(argv[0]);
++#endif
+     savestate_slots_init();
+     game_on_init();
+ 
+@@ -1847,7 +2022,7 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
              printf("[Smoke] Headless mode: running %d frames, hashing every %d\n",
                     s_smoke_frames, s_smoke_interval);
          }
@@ -536,7 +1399,7 @@ index d6c9e03..ce10f34 100644
          run_guest_execution();
          fprintf(stderr, "[Headless] game_run_main returned unexpectedly at frame %llu\n",
                  (unsigned long long)g_frame_count);
-@@ -1915,6 +2004,9 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
+@@ -1915,6 +2090,9 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
          char window_title[64];
          snprintf(window_title, sizeof(window_title), "NESRecomp - %s", game_get_name());
          Uint32 win_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
@@ -546,7 +1409,7 @@ index d6c9e03..ce10f34 100644
          /* Launcher tri-state: 1 = borderless (desktop resolution, letterboxed by
           * SDL_RenderSetLogicalSize), 2 = exclusive (real display mode change). */
          if (g_nes_config.fullscreen == 2)      win_flags |= SDL_WINDOW_FULLSCREEN;
-@@ -1960,7 +2052,7 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
+@@ -1960,7 +2138,7 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
      apply_presentation_geometry();
  
      {
@@ -555,7 +1418,7 @@ index d6c9e03..ce10f34 100644
          int cw = max_crt_width * CRT_SCALE;
          int ch = 240 * CRT_SCALE;
          s_crt_buf = (uint32_t *)malloc((size_t)cw * ch * sizeof(uint32_t));
-@@ -1985,6 +2077,14 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
+@@ -1985,6 +2163,14 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
          }
          apply_presentation_geometry();
      }
@@ -570,7 +1433,7 @@ index d6c9e03..ce10f34 100644
  
      /* HD texture pack (Mesen HD Pack): opt-in via the NESRECOMP_HDPACK env var
       * or config.ini [Display] HdPackEnabled/HdPackDir. When a pack loads, present
-@@ -2025,7 +2125,7 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
+@@ -2025,7 +2211,7 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
          }
      }
  
@@ -579,6 +1442,16 @@ index d6c9e03..ce10f34 100644
  
      /* Present-time palette LUT: default Raw (passthrough, byte-identical);
       * opt in via NESRECOMP_PALETTE={raw,2c02,fbx}. */
+@@ -2097,6 +2283,9 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
+     s_netplay_return_ready = 0;
+ #endif
+ 
++#if defined(NESRECOMP_NET) && defined(NESRECOMP_DESKTOP_PAUSE)
++    game_match_menu_close();
++#endif
+     /* Unreachable for most games, but clean up anyway */
+     if (s_audio_dev) { SDL_CloseAudioDevice(s_audio_dev); s_audio_dev = 0; }
+     if (s_bridge_ready) { rab_free(&s_bridge); s_bridge_ready = 0; }
 diff --git a/runner/src/nes_video.c b/runner/src/nes_video.c
 new file mode 100644
 index 0000000..8738e9e
@@ -770,7 +1643,7 @@ index 6813bb9..06f162f 100644
  static uint32_t *s_fb        = NULL;             /* presentation framebuffer */
  static uint32_t  s_back[DOT_MAXW * VISIBLE_LINES]; /* render target (double buffer) */
 diff --git a/runner/src/ppu_renderer.c b/runner/src/ppu_renderer.c
-index 3ce36ba..d75793a 100644
+index 3ce36ba..48ede58 100644
 --- a/runner/src/ppu_renderer.c
 +++ b/runner/src/ppu_renderer.c
 @@ -5,6 +5,7 @@
@@ -803,7 +1676,43 @@ index 3ce36ba..d75793a 100644
      g_render_irq_fired = 0;
      g_render_irq_scanline = -1;
      g_render_irq_chr_changed = 0;
-@@ -1209,3 +1216,113 @@ render_sprites:
+@@ -506,6 +513,13 @@ void ppu_render_frame(uint32_t *framebuf) {
+     /* Pre-IRQ CHR snapshot for the sprite pass (see s_chr_pre_irq). Taken
+      * before any scanline-IRQ service can rebank the live window. */
+     memcpy(s_chr_pre_irq, g_chr_ram, sizeof(s_chr_pre_irq));
++#ifdef NESRECOMP_DESKTOP_PAUSE
++    extern void rcr_native_sprite_tags(uint8_t tags[64]);
++    extern uint8_t rcr_shirt_color(int owner, uint8_t original);
++    extern uint8_t rcr_sprite_color(uint8_t tag,uint8_t tile,int row,int bit,int pixel,uint8_t original);
++    uint8_t appearance_tags[64];
++    rcr_native_sprite_tags(appearance_tags);
++#endif
+     uint8_t render_oam[0x100];
+     uint16_t render_oam_x16[64];
+     uint8_t render_start_mask = g_ppumask;
+@@ -1173,6 +1187,10 @@ render_sprites:
+                     continue;
+                 }
+                 uint8_t nes_color = g_ppu_pal[(spr_pal * 4 + color_idx) & 0x1F] & 0x3F;
++#ifdef NESRECOMP_DESKTOP_PAUSE
++                if (appearance_tags[s])
++                    nes_color = rcr_sprite_color(appearance_tags[s], tile_num, tile_row, chr_bit, color_idx, nes_color);
++#endif
+                 uint32_t spc = g_nes_palette[nes_color];
+                 framebuf[py * g_render_width + fb_x] = spc;
+                 if (g_hp && fb_x >= 0 && fb_x < g_render_width) {
+@@ -1182,6 +1200,10 @@ render_sprites:
+                     hp->sp_t16   = &chr_src[tile_chr_base + tile_num * 16];
+                     hp->sp_p1 = g_ppu_pal[(spr_pal * 4 + 1) & 0x1F] & 0x3F;
+                     hp->sp_p2 = g_ppu_pal[(spr_pal * 4 + 2) & 0x1F] & 0x3F;
++#ifdef NESRECOMP_DESKTOP_PAUSE
++                    if (color_idx==1) hp->sp_p1=nes_color;
++                    hp->sp_p2 = rcr_shirt_color(appearance_tags[s] & 3, hp->sp_p2);
++#endif
+                     hp->sp_p3 = g_ppu_pal[(spr_pal * 4 + 3) & 0x1F] & 0x3F;
+                     hp->sp_ox = (uint8_t)(7 - bit);   /* screen column within tile */
+                     hp->sp_oy = (uint8_t)(row & 7);   /* screen row within displayed cell */
+@@ -1209,3 +1231,113 @@ render_sprites:
      }
  #endif
  }
@@ -917,8 +1826,31 @@ index 3ce36ba..d75793a 100644
 +        }
 +    }
 +}
+diff --git a/runner/src/recomp_audio_drc.h b/runner/src/recomp_audio_drc.h
+index f6f065f..9cd0f1b 100644
+--- a/runner/src/recomp_audio_drc.h
++++ b/runner/src/recomp_audio_drc.h
+@@ -237,6 +237,18 @@ int rab_init(rab_bridge *b, const rab_config *cfg) {
+     return 0;
+ }
+ 
++/* Drop pre-pause output while the device callback is suspended. */
++static inline void rab_discard(rab_bridge *b) {
++    memset(b->ring, 0, (size_t)b->cap * b->cfg.channels * sizeof(float));
++    b->in_count = 0;
++    b->out_pos = b->half - 1;
++    b->cur_step = b->cfg.source_rate / b->cfg.host_rate;
++    b->err_lp = b->corr = b->gain = 0;
++    b->primed = b->concealing = 0;
++    b->prime_ms = b->cfg.target_ms;
++    b->last_out[0] = b->last_out[1] = 0;
++}
++
+ void rab_free(rab_bridge *b) {
+     if (!b) return;
+     free(b->coeffs); b->coeffs = NULL;
 diff --git a/runner/src/runtime.c b/runner/src/runtime.c
-index ead8435..ab767f3 100644
+index ead8435..9f7d067 100644
 --- a/runner/src/runtime.c
 +++ b/runner/src/runtime.c
 @@ -476,6 +476,7 @@ static int      s_guest_tick_charged = 0;
@@ -957,7 +1889,20 @@ index ead8435..ab767f3 100644
          if (pc) *pc = s_frame_resume_pc;
          if (tick_charged) *tick_charged = s_frame_resume_tick_charged;
          return 1;
-@@ -2493,6 +2508,8 @@ int g_nested_nmi_policy = NESTED_NMI_POKE_SPIN_FLAGS;
+@@ -1548,6 +1563,12 @@ void nes_write(uint16_t addr, uint8_t val) {
+     if (addr <= 0x1FFF) {
+         uint16_t a = addr & 0x07FF;
+         uint8_t old_val = g_ram[a];
++#ifdef NESRECOMP_DESKTOP_PAUSE
++        if ((a & 0x703) == 0x202 || ((a & 0x703) == 0x201 && s_guest_pc == 0xeeaa)) {
++            extern void rcr_oam_sprite_write(uint16_t pc, int slot);
++            rcr_oam_sprite_write(s_guest_pc, (a & 255)/4);
++        }
++#endif
+         if (g_ws_oam_sidecar && (a & 0x0700) == 0x0200 && (a & 3) == 3)
+             ws_sidecar_track(a, val);
+         if (s_ww_state != 0) wram_write_watch(a, old_val, val);
+@@ -2493,6 +2514,8 @@ int g_nested_nmi_policy = NESTED_NMI_POKE_SPIN_FLAGS;
  uint16_t g_code_window_base = 0xE000;
  static int32_t s_tail_pending = -1;
  static int     s_tail_caller  = -1;
@@ -966,7 +1911,7 @@ index ead8435..ab767f3 100644
  
  void runtime_prepare_guest_resume(uint16_t pc, int tick_charged) {
      extern uint16_t g_rts_target;
-@@ -2503,6 +2520,11 @@ void runtime_prepare_guest_resume(uint16_t pc, int tick_charged) {
+@@ -2503,6 +2526,11 @@ void runtime_prepare_guest_resume(uint16_t pc, int tick_charged) {
      g_nes_dispatch_depth = 0;
      s_tail_pending = -1;
      s_tail_caller = -1;
@@ -978,7 +1923,7 @@ index ead8435..ab767f3 100644
      g_rts_target = 0;
      g_rti_target = 0;
      s_in_irq = 0;
-@@ -2860,8 +2882,6 @@ static struct {
+@@ -2860,8 +2888,6 @@ static struct {
      uint8_t s;
      uint64_t interrupt_epoch;
  } s_tail_active[TAIL_ACTIVE_MAX];
