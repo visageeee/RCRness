@@ -1,5 +1,15 @@
 # RCRness
 
+## What's new in this fork
+
+- **Widescreen co-op fixes.** Fixed whole fighters flickering on the opening street and moving back and forth as the camera scrolled. Fighters stay visible as they cross the original viewport edge.
+- **Desktop pause menu.** Press **Esc** to pause local play, even inside the NES inventory screen. Use the keyboard or either controller to resume, change options, or quit. **Start** still opens the original menu for inventory, stats, and passwords.
+- **Display options.** Open **Esc → Options** to compare widescreen settings, the CRT filter, and sprite-flicker reduction on the frozen scene.
+- **Per-player controls.** Open **Esc → Controls** to see or change either player's keyboard and controller bindings. You can swap conflicting inputs and restore one player's defaults.
+- **Shirt and hair colors.** Open **Esc → Characters** to preview Alex and Ryan side by side. Choose each fighter's shirt and hair colors independently, or select **Original**. Your choices carry across restarts and save-state loads.
+
+## About RCRness
+
 Public, ROM-free NESRecomp project for a user-owned **River City Ransom (USA)**
 ROM. This repository intentionally contains no ROM, generated game code,
 playable executable, save data, captures, Ghidra project, or other copyrighted
