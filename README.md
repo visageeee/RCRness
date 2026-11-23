@@ -7,7 +7,7 @@
 - **Widescreen wallets.** Each active fighter’s cash appears beside their name and stamina bar. Narrow Fit windows show it beneath the name.
 - **Display options.** Open **Esc → Options** to compare widescreen settings, the CRT filter, and sprite-flicker reduction on the frozen scene.
 - **Per-player controls.** Open **Esc → Controls** to see or change either player's keyboard and controller bindings. You can swap conflicting inputs and restore one player's defaults.
-- **Character customization.** In **Esc → Characters**, choose hair and eyes independently for Alex and Ryan from the players, street fighters, bosses, townspeople, and shopkeepers. Both fighters also have separate shirt, pants, and hair colors. Turn on **Oni mode** to dress both players as Konoko, with purple spikes, sunglasses, a fitted leather jacket, and riding pants. Selections carry across restarts and save-state loads.
+- **Character customization.** In **Esc → Characters**, choose hair and eyes independently for Alex and Ryan from the players, street fighters, bosses, townspeople, and shopkeepers. Both fighters also have separate shirt, pants, and hair colors. Turn on **Oni mode** to dress both players as Konoko from the game Oni by Bungie software.
 - **City map.** Open **Esc → Map** for a connected atlas of all 35 areas. Each label sits beneath a scaled panorama of the entire playfield. A gold outline marks your location, blue frames mark malls, and a blinking red diamond shows the next required boss. The **Next** number identifies the destination even when it is outside the zoomed view. Use the arrows or D-pad to explore, **Tab** or controller **X** to zoom, and **Enter** or controller confirm to return to your area.
 
 ## About RCRness
