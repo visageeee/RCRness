@@ -16,6 +16,8 @@
 #include <SDL.h>
 #include <stdio.h>
 #include <limits.h>
+#include <errno.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -99,7 +101,9 @@ static BloodDrop blood_drops[BLOOD_DROPS];
 static uint8_t blood_stains[ROOMS][STREET_BOTTOM-STREET_TOP][STREET_WIDTH/8];
 static uint8_t room_stained[ROOMS];
 static int blood_drop_next, blood_room=-1;
-static char blood_path[1200];
+static char blood_dir[1024], blood_path[1200];
+/* Zero identifies the shared journal referenced by pre-isolation saves. */
+static uint32_t blood_game=UINT32_MAX;
 static FILE *blood_file;
 static int blood_write_failed, blood_pending;
 
@@ -130,16 +134,45 @@ static void load_stains(FILE *f) {
     }
 }
 
-static void blood_storage_init(void) {
-    char dir[1024];
-    nesrecomp_exe_dir(dir,sizeof dir);
-    snprintf(blood_path,sizeof blood_path,"%srcr-blood-v1.bin",dir);
+static void select_blood_game(uint32_t game) {
+    if (blood_file) fclose(blood_file);
+    blood_file=NULL;
+    blood_write_failed=blood_pending=0;
+    blood_path[0]=0;
+    blood_game=game;
+    memset(blood_stains,0,sizeof blood_stains);
+    memset(room_stained,0,sizeof room_stained);
+    rcr_clear_blood_spray();
+    if (game==UINT32_MAX || !blood_dir[0]) return;
+    if (game==0) snprintf(blood_path,sizeof blood_path,"%srcr-blood-v1.bin",blood_dir);
+    else snprintf(blood_path,sizeof blood_path,"%srcr-blood-%08x.bin",blood_dir,(unsigned)game);
     FILE *f=fopen(blood_path,"rb");
     if (f) { load_stains(f); fclose(f); }
 }
 
+void rcr_new_game(void) { select_blood_game(UINT32_MAX); }
+
+static void reserve_blood_game(void) {
+    if (blood_game!=UINT32_MAX || !blood_dir[0] || blood_write_failed) return;
+    uint32_t id=(uint32_t)time(NULL);
+    for (;;) {
+        if (!id || id==UINT32_MAX) id=1;
+        snprintf(blood_path,sizeof blood_path,"%srcr-blood-%08x.bin",blood_dir,(unsigned)id);
+        FILE *reserved=fopen(blood_path,"wbx");
+        if (reserved) { fclose(reserved); blood_game=id; return; }
+        if (errno!=EEXIST) {
+            perror("Creating street blood journal");
+            blood_write_failed=1;
+            return;
+        }
+        ++id;
+    }
+}
+
 static void save_stain(int room,int x,int y) {
-    if (!stain_pixel(room,x,y) || !blood_path[0] || blood_write_failed) return;
+    if (!stain_pixel(room,x,y)) return;
+    reserve_blood_game();
+    if (!blood_path[0] || blood_write_failed) return;
     if (!blood_file) blood_file=fopen(blood_path,"ab");
     int pixel=(y-STREET_TOP)*STREET_WIDTH+x;
     uint8_t entry[]={128|room,pixel>>14,(pixel>>7)&127,pixel&127};
@@ -1626,6 +1659,20 @@ uint8_t rcr_ws_read(uint16_t pc, uint16_t addr, uint8_t value) {
          * the room's left edge despite an otherwise valid local position. */
         if (origin<0) origin=0;
         handled=1; s_collision_reads++;
+    } else if (g_current_bank==6 && (pc==0x9682 || pc==0x9686)) {
+        /* The retreat routine frees the enemy slot if X - origin has a
+         * nonzero high byte. Give it a 256-pixel window within the visible
+         * street, sliding with the enemy until the window reaches an edge. */
+        int slot=g_cpu.X;
+        if (slot!=2 && slot!=3) return value;
+        int left=view_left(camera(),g_render_width);
+        int right=left+g_render_width;
+        if (left<0) left=0;
+        if (right>live_terrain.pages*256) right=live_terrain.pages*256;
+        origin=world_x(slot);
+        if (origin<left) origin=left;
+        if (origin>right-256) origin=right-256;
+        handled=1;
     } else if (g_current_bank==4 && (pc==0xb4af || pc==0xb4b5 || pc==0xbc19 || pc==0xbc1f)) {
         int obj=g_cpu.X;
         if (obj>=OBJECTS) return value;
@@ -1674,11 +1721,14 @@ typedef struct {
     uint8_t head_items,headless,saws,opening_saw;
     StreetWeapon street[STREET_SLOTS];
     int32_t street_room;
+    uint32_t blood_game;
 } ActorSave;
 _Static_assert(sizeof(ActorSave)<=NES_MOD_SAVESTATE_BLOB_CAP,"actor state exceeds save record");
 static int state_get(uint8_t *buf, int cap) {
     if (cap<(int)sizeof(ActorSave)) return -1;
     ActorSave state={0};
+    reserve_blood_game(); /* Even a clean save may acquire stains later. */
+    state.blood_game=blood_game;
     memcpy(state.street,street_items,sizeof street_items); state.street_room=street_room;
     state.saws=saw_items; state.opening_saw=opening_saw;
     state.head_items=head_items; state.headless=headless_fighters;
@@ -1692,7 +1742,7 @@ static int state_get(uint8_t *buf, int cap) {
 }
 static int state_set(const uint8_t *buf, int len) {
     /* v0.1.6 states have the same source packets but no pending-list field. */
-    if (len!=sizeof(ActorSave) && len!=offsetof(ActorSave,street) && len!=offsetof(ActorSave,head_items) && len!=offsetof(ActorSave,shadow_camera) && len!=offsetof(ActorSave,list_pending)) return 0;
+    if (len!=sizeof(ActorSave) && len!=offsetof(ActorSave,blood_game) && len!=offsetof(ActorSave,street) && len!=offsetof(ActorSave,head_items) && len!=offsetof(ActorSave,shadow_camera) && len!=offsetof(ActorSave,list_pending)) return 0;
     ActorSave state={0}; memcpy(&state,buf,(size_t)len);
     if (state.list_pending>1) return 0;
     if (state.room>=ROOMS) return 0;
@@ -1700,7 +1750,8 @@ static int state_set(const uint8_t *buf, int len) {
         if (state.shadow[i].valid>1 || state.present[i].valid>1 ||
             state.shadow[i].type>=0x40 || state.present[i].type>=0x40) return 0;
     }
-    if (len==sizeof state) {
+    int has_street=len>=(int)offsetof(ActorSave,blood_game);
+    if (has_street) {
         if (state.street_room < -1 || state.street_room >= 256) return 0;
         for (int i=0;i<STREET_SLOTS;++i) {
             StreetWeapon w=state.street[i];
@@ -1709,7 +1760,7 @@ static int state_set(const uint8_t *buf, int len) {
     }
     bodies.count=bodies.next=0; /* Older saves have no subsequent body record. */
     memcpy(street_items,state.street,sizeof street_items);
-    street_room=len==sizeof state ? state.street_room : -1;
+    street_room=has_street ? state.street_room : -1;
     saw_items=state.saws&0x70; opening_saw=state.opening_saw!=0;
     head_items=state.head_items&0x70;
     headless_fighters=state.headless&0x0c;
@@ -1717,7 +1768,7 @@ static int state_set(const uint8_t *buf, int len) {
         state.shadow[i].item_art=state.present[i].item_art=0;
         state.shadow[i].headless=state.present[i].headless=0;
     }
-    rcr_clear_blood_spray();
+    select_blood_game(state.blood_game);
     memset(&s_actors,0,sizeof s_actors);
     s_actors.sequence=state.sequence; s_actors.room=(uint8_t)state.room;
     s_list_pending=state.list_pending;
@@ -1785,7 +1836,7 @@ void rcr_ws_init(const char *rom_path) {
     int ok=fseek(f,16,SEEK_SET)==0 && fread(s_rom,1,sizeof s_rom,f)==sizeof s_rom;
     fclose(f);
     if (!ok) { fprintf(stderr,"[Widescreen] Incomplete owner ROM\n"); return; }
-    blood_storage_init();
+    nesrecomp_exe_dir(blood_dir,sizeof blood_dir);
     load_faces();
     s_ready=1;
     nes_video_on_window_resized(1280,720);

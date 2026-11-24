@@ -18,7 +18,7 @@ index 11a5f77..0e44ddb 100644
      if (am == AM_ABSX || am == AM_ABSY) {
          for (int i = 0; i < cfg->ram_read_hook_count; i++)
 diff --git a/runner/include/config.h b/runner/include/config.h
-index 2a28f50..e96220f 100644
+index 2a28f50..00ce14f 100644
 --- a/runner/include/config.h
 +++ b/runner/include/config.h
 @@ -24,7 +24,7 @@ typedef struct {
@@ -30,7 +30,7 @@ index 2a28f50..e96220f 100644
      int player_src[2];    /* default { 2 gamepad (+ keyboard fallback), 2 gamepad } */
      int deadzone[2];      /* 0..100 percent; default { 30, 30 } */
  
-@@ -43,6 +43,14 @@ typedef struct {
+@@ -43,6 +43,15 @@ typedef struct {
       * + folder picker write these. NESRECOMP_HDPACK env overrides both. */
      int  hdpack_enabled;   /* 0 off, 1 on; default 1 (master switch) */
      char hdpack_dir[512];  /* pack folder; "" = default <exe>/hdpack */
@@ -42,15 +42,16 @@ index 2a28f50..e96220f 100644
 +    int oni_mode;
 +    int blood_effects;
 +    int persistent_bodies;
++    int coin_bounce_sound;
  } NesConfig;
  
  extern NesConfig g_nes_config;
-@@ -67,3 +75,7 @@ void config_load(const char *path);
+@@ -67,3 +76,7 @@ void config_load(const char *path);
  
  /* Write g_nes_config to config.ini at `path`. */
  void config_save(const char *path);
 +
-+typedef enum { DISPLAY_WIDESCREEN_MODE, DISPLAY_CRT, DISPLAY_FLICKER, DISPLAY_PIXEL_ASPECT, DISPLAY_ALEX_SHIRT, DISPLAY_RYAN_SHIRT, DISPLAY_ALEX_HAIR, DISPLAY_RYAN_HAIR, DISPLAY_ALEX_STYLE, DISPLAY_RYAN_STYLE, DISPLAY_ALEX_EYES, DISPLAY_RYAN_EYES, DISPLAY_ALEX_PANTS, DISPLAY_RYAN_PANTS, DISPLAY_ONI_MODE, DISPLAY_BLOOD, DISPLAY_BODIES } DisplaySetting;
++typedef enum { DISPLAY_WIDESCREEN_MODE, DISPLAY_CRT, DISPLAY_FLICKER, DISPLAY_PIXEL_ASPECT, DISPLAY_ALEX_SHIRT, DISPLAY_RYAN_SHIRT, DISPLAY_ALEX_HAIR, DISPLAY_RYAN_HAIR, DISPLAY_ALEX_STYLE, DISPLAY_RYAN_STYLE, DISPLAY_ALEX_EYES, DISPLAY_RYAN_EYES, DISPLAY_ALEX_PANTS, DISPLAY_RYAN_PANTS, DISPLAY_ONI_MODE, DISPLAY_BLOOD, DISPLAY_BODIES, DISPLAY_COIN_BOUNCE_SOUND } DisplaySetting;
 +/* Persist only the preference the player explicitly edited. */
 +void config_save_display_setting(DisplaySetting setting);
 diff --git a/runner/include/controller.h b/runner/include/controller.h
@@ -310,14 +311,14 @@ index f30d181..d1b52de 100644
      ${NESRECOMP_RUNNER_ROOT}/src/recomp_stack.c
      ${NESRECOMP_RUNNER_ROOT}/src/ppu_renderer.c
 diff --git a/runner/src/config.c b/runner/src/config.c
-index 0900816..4a47b88 100644
+index 0900816..b6174a3 100644
 --- a/runner/src/config.c
 +++ b/runner/src/config.c
 @@ -66,6 +66,7 @@ NesConfig g_nes_config = {
      /*skip_launcher*/ 0,
      /*netplay*/ "Player", "ws://netplay.technicallycomputers.ca:8765",
      /*hdpack_enabled*/ 1, /*hdpack_dir*/ "",  /* on by default; loads <exe>/hdpack if present */
-+    {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, "", 0, 0, 0,
++    {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, "", 0, 0, 0, 1,
  };
  
  void config_set_defaults(NesConfig *c) {
@@ -326,7 +327,7 @@ index 0900816..4a47b88 100644
          0,
          "Player", "ws://netplay.technicallycomputers.ca:8765",
 -        1, "",
-+        1, "", {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, "", 0, 0, 0,
++        1, "", {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, "", 0, 0, 0, 1,
      };
      if (c) *c = d;
  }
@@ -341,7 +342,7 @@ index 0900816..4a47b88 100644
      FILE *f = fopen(path, "r");
      if (!f) return;
      char line[256];
-@@ -116,43 +117,53 @@ void config_load(const char *path) {
+@@ -116,43 +117,54 @@ void config_load(const char *path) {
          char *key = trim(s);
          char *valstr = trim(eq + 1);
          int   val = atoi(valstr);
@@ -366,6 +367,7 @@ index 0900816..4a47b88 100644
 +        else if (!strcmp(key, "RyanPants")) c->pants[1] = val;
 +        else if (!strcmp(key, "BloodEffects")) c->blood_effects = val != 0;
 +        else if (!strcmp(key, "PersistentBodies")) c->persistent_bodies = val != 0;
++        else if (!strcmp(key, "CoinBounceSound")) c->coin_bounce_sound = val != 0;
 +        else if (!strcmp(key, "OniMode")) c->oni_mode = val != 0;
 +        else if (!strcmp(key, "AlexHairStyle")) c->hair_style[0] = val;
 +        else if (!strcmp(key, "RyanHairStyle")) c->hair_style[1] = val;
@@ -420,7 +422,7 @@ index 0900816..4a47b88 100644
      fprintf(f, "# NESRecomp settings — edited by the launcher's Settings view.\n");
      fprintf(f, "[Display]\n");
      fprintf(f, "WindowScale = %d\n",   c->window_scale);
-@@ -161,11 +172,20 @@ void config_save(const char *path) {
+@@ -161,11 +173,21 @@ void config_save(const char *path) {
      fprintf(f, "LinearFilter = %d\n",  c->linear_filter);
      fprintf(f, "Renderer = %d\n",      c->renderer);
      fprintf(f, "Widescreen = %d\n",    c->widescreen);
@@ -429,6 +431,7 @@ index 0900816..4a47b88 100644
      fprintf(f, "ReduceSpriteFlicker = %d\n", c->reduce_sprite_flicker);
 +    fprintf(f, "BloodEffects = %d\n", c->blood_effects);
 +    fprintf(f, "PersistentBodies = %d\n", c->persistent_bodies);
++    fprintf(f, "CoinBounceSound = %d\n", c->coin_bounce_sound);
      fprintf(f, "CrtFilter = %d\n",     c->crt_filter);
      fprintf(f, "HdPackEnabled = %d\n", c->hdpack_enabled);
      fprintf(f, "HdPackDir = %s\n",     c->hdpack_dir);
@@ -441,7 +444,7 @@ index 0900816..4a47b88 100644
      fprintf(f, "[Audio]\n");
      fprintf(f, "Volume = %d\n",        c->volume);
      fprintf(f, "[Input]\n");
-@@ -179,3 +199,34 @@ void config_save(const char *path) {
+@@ -179,3 +201,35 @@ void config_save(const char *path) {
      fprintf(f, "NetplayLobbyUrl = %s\n", c->netplay_lobby_url);
      fclose(f);
  }
@@ -459,6 +462,7 @@ index 0900816..4a47b88 100644
 +        break;
 +    case DISPLAY_BLOOD: saved.blood_effects = g_nes_config.blood_effects; break;
 +    case DISPLAY_BODIES: saved.persistent_bodies = g_nes_config.persistent_bodies; break;
++    case DISPLAY_COIN_BOUNCE_SOUND: saved.coin_bounce_sound = g_nes_config.coin_bounce_sound; break;
 +    case DISPLAY_ONI_MODE: saved.oni_mode = g_nes_config.oni_mode; break;
 +    case DISPLAY_ALEX_EYES: saved.eyes[0] = g_nes_config.eyes[0]; break;
 +    case DISPLAY_RYAN_EYES: saved.eyes[1] = g_nes_config.eyes[1]; break;
@@ -956,6 +960,26 @@ index 65c7101..05ced53 100644
 +    else { s_binds.p2=defaults.p2; s_binds.pad2=defaults.pad2; }
 +    return persist_bindings(before);
 +}
+diff --git a/runner/src/launcher.c b/runner/src/launcher.c
+index c76bac5..4785026 100644
+--- a/runner/src/launcher.c
++++ b/runner/src/launcher.c
+@@ -541,8 +541,13 @@ reopen_recomp_launcher:
+                     rom_path);
+         }
+     } else {
+-        /* Try rom.cfg first */
+-        rom_cfg_read(rom_path, sizeof(rom_path));
++        /* A desktop launch asks for a ROM, even after a previous selection.
++         * Flag-only invocations may still use the cached ROM for automation. */
++#if defined(__linux__) && defined(NESRECOMP_DESKTOP_PAUSE)
++        if (argc==1) rom_path[0]='\0';
++        else
++#endif
++            rom_cfg_read(rom_path, sizeof(rom_path));
+ 
+         int valid = 0;
+         while (!valid) {
 diff --git a/runner/src/main_runner.c b/runner/src/main_runner.c
 index d6c9e03..34bda6a 100644
 --- a/runner/src/main_runner.c
@@ -2043,7 +2067,7 @@ index f6f065f..9cd0f1b 100644
      if (!b) return;
      free(b->coeffs); b->coeffs = NULL;
 diff --git a/runner/src/runtime.c b/runner/src/runtime.c
-index ead8435..69954cf 100644
+index ead8435..a834257 100644
 --- a/runner/src/runtime.c
 +++ b/runner/src/runtime.c
 @@ -476,6 +476,7 @@ static int      s_guest_tick_charged = 0;
@@ -2098,11 +2122,16 @@ index ead8435..69954cf 100644
      s_open_bus = v;
      return v;
  }
-@@ -1548,6 +1572,27 @@ void nes_write(uint16_t addr, uint8_t val) {
+@@ -1548,6 +1572,32 @@ void nes_write(uint16_t addr, uint8_t val) {
      if (addr <= 0x1FFF) {
          uint16_t a = addr & 0x07FF;
          uint8_t old_val = g_ram[a];
 +#ifdef NESRECOMP_DESKTOP_PAUSE
++        /* Fixed-bank new-game initialization seeds Alex's starting wallet. */
++        if (a==0x4c7 && s_guest_pc==0xf704) {
++            extern void rcr_new_game(void);
++            rcr_new_game();
++        }
 +        /* Enemy slots 2 and 3 turn into money at the end of the defeat animation. */
 +        if (s_guest_pc==0xafc8 && g_current_bank==6 && (a==0xcd || a==0xce) && old_val<8 && val==0x10) {
 +            extern void rcr_enemy_coin(int slot);
@@ -2126,7 +2155,20 @@ index ead8435..69954cf 100644
          if (g_ws_oam_sidecar && (a & 0x0700) == 0x0200 && (a & 3) == 3)
              ws_sidecar_track(a, val);
          if (s_ww_state != 0) wram_write_watch(a, old_val, val);
-@@ -2493,6 +2538,8 @@ int g_nested_nmi_policy = NESTED_NMI_POKE_SPIN_FLAGS;
+@@ -1600,6 +1650,12 @@ void nes_write(uint16_t addr, uint8_t val) {
+         return;
+     }
+     if (addr >= 0x4000 && addr <= 0x401F) {
++#ifdef NESRECOMP_DESKTOP_PAUSE
++        if (addr==0x4004) {
++            extern uint8_t rcr_pulse2_volume(uint8_t volume);
++            val=rcr_pulse2_volume(val);
++        }
++#endif
+         apu_trace_push(g_nes_cycles, addr, val);
+         apu_write(addr, val);
+         return;
+@@ -2493,6 +2549,8 @@ int g_nested_nmi_policy = NESTED_NMI_POKE_SPIN_FLAGS;
  uint16_t g_code_window_base = 0xE000;
  static int32_t s_tail_pending = -1;
  static int     s_tail_caller  = -1;
@@ -2135,7 +2177,7 @@ index ead8435..69954cf 100644
  
  void runtime_prepare_guest_resume(uint16_t pc, int tick_charged) {
      extern uint16_t g_rts_target;
-@@ -2503,6 +2550,11 @@ void runtime_prepare_guest_resume(uint16_t pc, int tick_charged) {
+@@ -2503,6 +2561,11 @@ void runtime_prepare_guest_resume(uint16_t pc, int tick_charged) {
      g_nes_dispatch_depth = 0;
      s_tail_pending = -1;
      s_tail_caller = -1;
@@ -2147,7 +2189,7 @@ index ead8435..69954cf 100644
      g_rts_target = 0;
      g_rti_target = 0;
      s_in_irq = 0;
-@@ -2860,8 +2912,6 @@ static struct {
+@@ -2860,8 +2923,6 @@ static struct {
      uint8_t s;
      uint64_t interrupt_epoch;
  } s_tail_active[TAIL_ACTIVE_MAX];

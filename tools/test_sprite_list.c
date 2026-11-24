@@ -62,8 +62,10 @@ static void test_blood(void) {
     load_stains(blood_file);
     for (int x=0;x<512;++x) assert(!stain_pixel(3,x,140));
     assert(!stain_pixel(4,900,180));
-    fclose(blood_file); blood_file=NULL; blood_path[0]=0; blood_pending=0;
-    rcr_clear_blood_spray();
+    rcr_new_game();
+    assert(!blood_file && !blood_pending && blood_game==UINT32_MAX);
+    assert(!room_stained[3] && !room_stained[4]);
+    assert(stain_pixel(3,0,140) && stain_pixel(4,900,180));
     /* Count each burst at the damage callback, including a held weapon
      * during a kick, a weapon swing by an enemy, and a thrown object. */
     static const struct { int source,move,drops; } hits[]={
@@ -125,6 +127,7 @@ static void test_blood(void) {
     int size=state_get(snapshot,sizeof snapshot);
     enter_street(1);
     assert(!street_items[1].type && state_set(snapshot,size));
+    assert(state_set(snapshot,offsetof(ActorSave,blood_game)) && blood_game==0);
     assert(street_items[1].kind && street_items[0].type==15);
     uint8_t guest_snapshot[sizeof g_ram];
     memcpy(guest_snapshot,g_ram,sizeof guest_snapshot);

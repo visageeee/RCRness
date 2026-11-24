@@ -91,6 +91,15 @@ void game_on_frame(uint64_t frame_count) {
     rcr_ws_frame();
 }
 
+/* Bank 5 SFX $1C has one voice: track 5 plays $8AA7..$8AC2 on
+ * pulse 2. Music also uses pulse 2, with driver index 1. */
+uint8_t rcr_pulse2_volume(uint8_t volume) {
+    if (g_nes_config.coin_bounce_sound || g_ram[0x750]!=5) return volume;
+    unsigned stream=g_ram[0x758] | (g_ram[0x760]<<8);
+    if (stream>=0x8aa7 && stream<0x8ac3) return (volume&0xe0)|0x10;
+    return volume;
+}
+
 void game_post_nmi(uint64_t frame_count) {
     (void)frame_count;
 }

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=RCRness
+Comment=Choose a River City Ransom ROM and play
+Exec="@RCRNESS_DESKTOP_EXEC@"
+Icon=applications-games
+Terminal=false
+Categories=Game;ActionGame;

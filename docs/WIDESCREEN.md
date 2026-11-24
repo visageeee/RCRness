@@ -80,6 +80,9 @@ Screen-dependent guest reads are scoped to verified call sites:
 - `$B4AF/$B4B5`, bank 4: special actor activation follows the displayed view.
 - `$BC19/$BC1F`, bank 4: authored replacement-wave positions are evaluated
   against the displayed view when the native spawner chooses a candidate.
+- `$9682/$9686`, bank 6: a fleeing enemy keeps its slot until it leaves
+  the visible street. In rooms narrower than the viewport, the exit is at
+  the room boundary.
 
 No extra logical enemies are invented. The original two enemy slots, gang and
 boss prerequisites, spawn tables, terrain collisions and room transitions

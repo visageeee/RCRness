@@ -39,6 +39,18 @@ if(WIN32)
             "$<TARGET_FILE_DIR:RCRness>"
     )
 endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Desktop Exec uses its own quoting, followed by desktop-string escaping.
+    set(RCRNESS_DESKTOP_EXEC "${CMAKE_CURRENT_BINARY_DIR}/RCRness")
+    foreach(char IN ITEMS "\\" "\"" "$" "`")
+        string(REPLACE "${char}" "\\${char}" RCRNESS_DESKTOP_EXEC "${RCRNESS_DESKTOP_EXEC}")
+    endforeach()
+    string(REPLACE "\\" "\\\\" RCRNESS_DESKTOP_EXEC "${RCRNESS_DESKTOP_EXEC}")
+    string(REPLACE "%" "%%" RCRNESS_DESKTOP_EXEC "${RCRNESS_DESKTOP_EXEC}")
+    configure_file(RCRness.desktop.in RCRness.desktop @ONLY
+        FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+endif()
+
 # The runner seeds missing bindings. Relinking must preserve player edits.
 
 if(MSVC)

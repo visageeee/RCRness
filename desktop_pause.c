@@ -33,7 +33,7 @@ static void refresh_slots(Menu *m) {
     for (int i=0;i<RCR_STATE_SLOTS;i++) m->slot_status[i]=runner_slot_status(i+1);
 }
 
-static const char *const option_rows[] = {"Widescreen", "CRT filter", "Reduce sprite flicker", "Blood effects", "Persistent bodies"};
+static const char *const option_rows[] = {"Widescreen", "CRT filter", "Reduce sprite flicker", "Blood effects", "Persistent bodies", "Coin bounce sound"};
 enum { OPTION_COUNT = sizeof option_rows / sizeof option_rows[0] };
 static const char *const quit_rows[] = {"Cancel", "Quit game"};
 static const struct { NesAspectMode mode; const char *label; } aspects[] = {
@@ -64,9 +64,12 @@ static void change_option(int row, int direction) {
         g_nes_config.blood_effects ^= 1;
         rcr_clear_blood_spray();
         config_save_display_setting(DISPLAY_BLOOD);
-    } else {
+    } else if (row == 4) {
         g_nes_config.persistent_bodies ^= 1;
         config_save_display_setting(DISPLAY_BODIES);
+    } else {
+        g_nes_config.coin_bounce_sound ^= 1;
+        config_save_display_setting(DISPLAY_COIN_BOUNCE_SOUND);
     }
 }
 
@@ -358,7 +361,7 @@ static void draw_menu(SDL_Renderer *r, SDL_Texture *texture, SDL_Texture **atlas
     case MAIN: height=menu.match?128:144; title=menu.match?"Match menu":"Paused"; break;
     case STATE_SLOTS: width=188; height=212; title="Save states"; break;
     case SLOT_ACTION: case OVERWRITE: width=192; height=92; title="Save states"; break;
-    case OPTIONS: width=236; height=112; title="Options"; break;
+    case OPTIONS: width=236; height=32+16*OPTION_COUNT; title="Options"; break;
     case CONFIRM_QUIT: height=64; title="Quit game?"; break;
     case CITY_MAP: draw_city_map(r,texture,atlas,&menu); return;
     case CONTROLS: width=PANEL_WIDTH; height=PANEL_HEIGHT; break;
@@ -421,6 +424,7 @@ static void draw_menu(SDL_Renderer *r, SDL_Texture *texture, SDL_Texture **atlas
                 if(i==2) value=g_nes_config.reduce_sprite_flicker?"On":"Off";
                 if(i==3) value=g_nes_config.blood_effects?"On":"Off";
                 if(i==4) value=g_nes_config.persistent_bodies?"On":"Off";
+                if(i==5) value=g_nes_config.coin_bounce_sound?"On":"Off";
                 lettering(pixels,width-10-(int)strlen(value)*8,y,value,paper);
             }
         }
